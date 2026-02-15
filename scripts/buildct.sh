@@ -158,12 +158,22 @@ process_opsmaru_repository() {
 # 创建容器
 create_container() {
     rm -rf "$name"
-    if [ -z "$image_download_url" ] && [ "$status_tuna" = true ]; then
-        lxc init opsmaru:${system} "$name" -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -s default
-    elif [ -z "$image_download_url" ]; then
-        lxc init images:${system} "$name" -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -s default
+    # 计算硬盘大小参数
+    if [[ $disk == *.* ]]; then
+        # 小数硬盘大小，转换为 MiB
+        disk_mb=$(echo "$disk * 1024" | bc | cut -d '.' -f 1)
+        disk_param="-d root,size=${disk_mb}MiB"
     else
-        lxc init "$image_name" "$name" -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -s default
+        # 整数硬盘大小，使用 GiB
+        disk_param="-d root,size=${disk}GiB"
+    fi
+    
+    if [ -z "$image_download_url" ] && [ "$status_tuna" = true ]; then
+        lxc init opsmaru:${system} "$name" -c limits.cpu="$cpu" -c limits.memory="$memory"MiB $disk_param -s default
+    elif [ -z "$image_download_url" ]; then
+        lxc init images:${system} "$name" -c limits.cpu="$cpu" -c limits.memory="$memory"MiB $disk_param -s default
+    else
+        lxc init "$image_name" "$name" -c limits.cpu="$cpu" -c limits.memory="$memory"MiB $disk_param -s default
     fi
     if [ $? -ne 0 ]; then
         echo "Container creation failed, please check the previous output message"
@@ -172,22 +182,15 @@ create_container() {
     fi
 }
 
-# 配置存储
+# 配置存储限制
 configure_storage() {
-    if [ -f /usr/local/bin/lxd_storage_type ]; then
-        storage_type=$(cat /usr/local/bin/lxd_storage_type)
-    else
-        storage_type="btrfs"
-    fi
+    # 硬盘大小已在创建容器时通过 -d root,size=... 参数设置
+    # 这里只设置额外的硬盘配额限制
     if [[ $disk == *.* ]]; then
         disk_mb=$(echo "$disk * 1024" | bc | cut -d '.' -f 1)
-        lxc storage create "$name" "$storage_type" size="$disk_mb"MB >/dev/null 2>&1
-        lxc config device override "$name" root size="$disk_mb"MB
-        lxc config device set "$name" root limits.max "$disk_mb"MB
+        lxc config device set "$name" root limits.max "$disk_mb"MiB
     else
-        lxc storage create "$name" "$storage_type" size="$disk"GB >/dev/null 2>&1
-        lxc config device override "$name" root size="$disk"GB
-        lxc config device set "$name" root limits.max "$disk"GB
+        lxc config device set "$name" root limits.max "$disk"GiB
     fi
 }
 
