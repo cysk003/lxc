@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # from
 # https://github.com/oneclickvirt/lxd
-# 2025.11.10
+# 2026.02.28
 
 
 check_vm_support() {
@@ -503,6 +503,7 @@ configure_network() {
     if [[ -z "$vm_ip" ]]; then
         echo "Error: VM failed to start or no IP address was assigned."
         echo "错误：虚拟机启动失败或未分配IP地址"
+        lxc delete --force "$name" 2>/dev/null || true
         exit 1
     fi
     ipv4_address=$(ip addr show | awk '/inet .*global/ && !/inet6/ {print $2}' | sed -n '1p' | cut -d/ -f1)
@@ -512,7 +513,7 @@ configure_network() {
         if [ "$enable_ipv6" == "y" ]; then
             echo "Configuring IPv6..."
             echo "配置IPv6..."
-            lxc exec "$name" -- echo '*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb' | crontab -
+            lxc exec "$name" -- sh -c 'echo "*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb" | crontab -'
             sleep 1
             if [ ! -f "./build_ipv6_network.sh" ]; then
                 curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/build_ipv6_network.sh -o build_ipv6_network.sh
@@ -602,7 +603,7 @@ cleanup_and_finish() {
     if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
         echo "$name $sshn $passwd $nat1 $nat2" >>"$name"
         echo "$name $sshn $passwd $nat1 $nat2"
-        exit 1
+        exit 0
     fi
     if [ "$nat1" == "0" ] && [ "$nat2" == "0" ]; then
         echo "$name $sshn $passwd" >>"$name"

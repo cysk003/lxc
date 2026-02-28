@@ -1,7 +1,6 @@
 #!/bin/bash
 #from https://github.com/oneclickvirt/lxd
-# 2025.09.18
-set -e
+# 2026.02.28
 
 # 服务管理兼容性函数
 service_manager() {

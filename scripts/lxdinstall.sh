@@ -1,6 +1,6 @@
 #!/bin/bash
 # by https://github.com/oneclickvirt/lxd
-# 2025.11.10
+# 2026.02.28
 
 # curl -L https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/lxdinstall.sh -o lxdinstall.sh && chmod +x lxdinstall.sh && bash lxdinstall.sh
 
@@ -682,7 +682,7 @@ init_storage_backend() {
     _green "尝试使用 $backend 类型，存储池大小为 $disk_nums"
     _green "Trying to use $backend type with storage pool size $disk_nums"
     local need_reboot=false
-    if [ "$backend" = "btrfs" ] && ! is_storage_installed "btrfs" ] && ! command -v btrfs >/dev/null; then
+    if [ "$backend" = "btrfs" ] && ! is_storage_installed "btrfs" && ! command -v btrfs >/dev/null; then
         _yellow "正在安装 btrfs-progs..."
         _yellow "Installing btrfs-progs..."
         install_package btrfs-progs
@@ -692,7 +692,7 @@ init_storage_backend() {
         _green "btrfs module could not be loaded. Please reboot the machine and execute this script again."
         echo "$backend" >/usr/local/bin/lxd_reboot
         need_reboot=true
-    elif [ "$backend" = "lvm" ] && ! is_storage_installed "lvm" ] && ! command -v lvm >/dev/null; then
+    elif [ "$backend" = "lvm" ] && ! is_storage_installed "lvm" && ! command -v lvm >/dev/null; then
         _yellow "正在安装 lvm2..."
         _yellow "Installing lvm2..."
         install_package lvm2
@@ -702,7 +702,7 @@ init_storage_backend() {
         _green "LVM module could not be loaded. Please reboot the machine and execute this script again."
         echo "$backend" >/usr/local/bin/lxd_reboot
         need_reboot=true
-    elif [ "$backend" = "zfs" ] && ! is_storage_installed "zfs" ] && ! command -v zfs >/dev/null; then
+    elif [ "$backend" = "zfs" ] && ! is_storage_installed "zfs" && ! command -v zfs >/dev/null; then
         _yellow "正在安装 zfsutils-linux..."
         _yellow "Installing zfsutils-linux..."
         install_package zfsutils-linux
@@ -712,17 +712,17 @@ init_storage_backend() {
         _green "ZFS module could not be loaded. Please reboot the machine and execute this script again."
         echo "$backend" >/usr/local/bin/lxd_reboot
         need_reboot=true
-    elif [ "$backend" = "ceph" ] && ! is_storage_installed "ceph" ] && ! command -v ceph >/dev/null; then
+    elif [ "$backend" = "ceph" ] && ! is_storage_installed "ceph" && ! command -v ceph >/dev/null; then
         _yellow "正在安装 ceph-common..."
         _yellow "Installing ceph-common..."
         install_package ceph-common
         record_installed_storage "ceph"
     fi
-    if [ "$backend" = "btrfs" ] && is_storage_installed "btrfs" ] && ! grep -q btrfs /proc/filesystems; then
+    if [ "$backend" = "btrfs" ] && is_storage_installed "btrfs" && ! grep -q btrfs /proc/filesystems; then
         modprobe btrfs || true
-    elif [ "$backend" = "lvm" ] && is_storage_installed "lvm" ] && ! grep -q dm-mod /proc/modules; then
+    elif [ "$backend" = "lvm" ] && is_storage_installed "lvm" && ! grep -q dm-mod /proc/modules; then
         modprobe dm-mod || true
-    elif [ "$backend" = "zfs" ] && is_storage_installed "zfs" ] && ! grep -q zfs /proc/filesystems; then
+    elif [ "$backend" = "zfs" ] && is_storage_installed "zfs" && ! grep -q zfs /proc/filesystems; then
         modprobe zfs || true
     fi
     if [ "$need_reboot" = true ]; then
@@ -921,7 +921,9 @@ main() {
     install_base_packages
     check_cdn_file
     rebuild_cloud_init
-    apt-get remove cloud-init -y
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get remove cloud-init -y
+    fi
     statistics_of_run_times
     install_lxd
     configure_resources

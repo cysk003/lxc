@@ -1,6 +1,6 @@
 #!/bin/bash
 # by https://github.com/oneclickvirt/lxd
-# 2025.08.14
+# 2026.02.28
 
 # ./build_ipv6_network.sh LXC容器名称 <是否使用iptables进行映射>
 
@@ -269,6 +269,7 @@ setup_ipv6_cron() {
 setup_iptables_mapping() {
     install_package netfilter-persistent
     # 寻找未使用的子网内的一个IPV6地址
+    local found_ipv6=""
     for i in $(seq 3 65535); do
         IPV6="${SUBNET_PREFIX}$i"
         if [[ $IPV6 == $CONTAINER_IPV6 ]]; then
@@ -280,17 +281,19 @@ setup_iptables_mapping() {
         if ! ping6 -c1 -w1 -q $IPV6 &>/dev/null; then
             if ! ip6tables -t nat -C PREROUTING -d $IPV6 -j DNAT --to-destination $CONTAINER_IPV6 &>/dev/null; then
                 _green "$IPV6"
+                found_ipv6="$IPV6"
                 break
             fi
         fi
         _yellow "$IPV6"
     done
     # 检查是否找到未使用的 IPV6 地址
-    if [ -z "$IPV6" ]; then
+    if [ -z "$found_ipv6" ]; then
         _red "No IPV6 address available, no auto mapping"
         _red "无可用 IPV6 地址，不进行自动映射"
         exit 1
     fi
+    IPV6="$found_ipv6"
     # 映射 IPV6 地址到容器的私有 IPV6 地址
     ip addr add "$IPV6"/"$ipv6_length" dev "$interface"
     ip6tables -t nat -A PREROUTING -d $IPV6 -j DNAT --to-destination $CONTAINER_IPV6

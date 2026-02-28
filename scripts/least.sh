@@ -3,11 +3,11 @@
 # https://github.com/oneclickvirt/lxd
 # cd /root
 # ./least.sh NAT服务器前缀 数量
-# 2025.11.10
+# 2026.02.28
 
 cd /root >/dev/null 2>&1
 if [ ! -d "/usr/local/bin" ]; then
-    mkdir -p "$directory"
+    mkdir -p "/usr/local/bin"
 fi
 
 check_china() {
@@ -91,6 +91,7 @@ for ((a = 1; a <= "$2"; a++)); do
     done
     if [[ -z "$container_ip" ]]; then
         echo "Error: Container failed to start or no IP address was assigned."
+        lxc delete --force "$name" 2>/dev/null || true
         exit 1
     fi
     ipv4_address=$(ip addr show | awk '/inet .*global/ && !/inet6/ {print $2}' | sed -n '1p' | cut -d/ -f1)
@@ -117,6 +118,7 @@ for ((a = 1; a <= "$2"; a++)); do
     if ! lxc config device override "$name" eth0 ipv4.address="$container_ip" 2>/dev/null; then
         if ! lxc config device set "$name" eth0 ipv4.address "$container_ip" 2>/dev/null; then
             echo "Error: Failed to set ipv4.address for device 'eth0' in container '$name'." >&2
+            lxc delete --force "$name" 2>/dev/null || true
             exit 1
         fi
     fi

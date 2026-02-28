@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # from
 # https://github.com/oneclickvirt/lxd
-# 2025.11.10
+# 2026.02.28
 
 # 输入
 # ./buildct.sh 服务器名称 CPU核数 内存大小 硬盘大小 SSH端口 外网起端口 外网止端口 下载速度 上传速度 是否启用IPV6(Y or N) 系统(留空则为debian12)
@@ -68,7 +68,7 @@ get_system_arch() {
 process_image() {
     image_download_url=""
     fixed_system=false
-    if [[ "$sys_bit" == "x86_64" || "$sys_bit" == "arm64" ]]; then
+    if [[ "$sys_bit" == "x86_64" || "$sys_bit" == "aarch64" ]]; then
         process_self_fixed_images
     else
         output=$(lxc image list images:${a}/${b})
@@ -335,6 +335,7 @@ configure_port() {
     done
     if [[ -z "$container_ip" ]]; then
         echo "Error: Container failed to start or no IP address was assigned."
+        lxc delete --force "$name" 2>/dev/null || true
         exit 1
     fi
     ipv4_address=$(ip addr show | awk '/inet .*global/ && !/inet6/ {print $2}' | sed -n '1p' | cut -d/ -f1)
@@ -342,6 +343,7 @@ configure_port() {
     if ! lxc config device override "$name" eth0 ipv4.address="$container_ip" 2>/dev/null; then
         if ! lxc config device set "$name" eth0 ipv4.address "$container_ip" 2>/dev/null; then
             echo "Error: Failed to set ipv4.address for device 'eth0' in container '$name'." >&2
+            lxc delete --force "$name" 2>/dev/null || true
             exit 1
         fi
     fi
@@ -356,7 +358,7 @@ configure_port() {
 configure_ipv6() {
     if [ -n "$enable_ipv6" ]; then
         if [ "$enable_ipv6" == "y" ]; then
-            lxc exec "$name" -- echo '*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb' | crontab -
+            lxc exec "$name" -- sh -c 'echo "*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb" | crontab -'
             sleep 1
             if [ ! -f "./build_ipv6_network.sh" ]; then
                 curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/build_ipv6_network.sh -o build_ipv6_network.sh
@@ -440,7 +442,7 @@ cleanup_and_output() {
         lxc config set "$name" user.description "$name $sshn $passwd $nat1 $nat2"
         echo "$name $sshn $passwd $nat1 $nat2" >>"$name"
         echo "$name $sshn $passwd $nat1 $nat2"
-        exit 1
+        exit 0
     fi
     if [ "$nat1" == "0" ] && [ "$nat2" == "0" ]; then
         lxc config set "$name" user.description "$name $sshn $passwd"

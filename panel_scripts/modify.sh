@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # from
 # https://github.com/oneclickvirt/lxd
-# 2023.12.21
+# 2026.02.28
 
 # 输入
 # ./modify.sh 服务器名称 SSH端口 外网起端口 外网止端口 下载速度 上传速度 是否启用IPV6(Y or N)
@@ -15,6 +15,8 @@ nat1="${3:-20002}"
 nat2="${4:-20025}"
 in="${5:-300}"
 out="${6:-300}"
+# 从容器内探测系统类型
+system=$(lxc exec "$name" -- sh -c "grep -i '^ID=' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '\"' | tr '[:upper:]' '[:lower:]'" 2>/dev/null || echo "debian")
 # 支持docker虚拟化
 lxc config set "$name" security.nesting true
 ori=$(date | md5sum)
@@ -70,11 +72,11 @@ else
     lxc exec "$name" -- bash config.sh
     lxc exec "$name" -- history -c
 fi
-lxc config device add "$name" ssh-port proxy listen=tcp:0.0.0.0:$sshn connect=tcp:127.0.0.1:22
+lxc config device add "$name" ssh-port proxy listen=tcp:0.0.0.0:$sshn connect=tcp:0.0.0.0:22 nat=true
 # 是否要创建V6地址
 if [ -n "$7" ]; then
     if [ "$7" == "Y" ]; then
-        lxc exec "$name" -- echo '*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb' | crontab -
+        lxc exec "$name" -- sh -c 'echo "*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb" | crontab -'
         sleep 1
         if [ ! -f "./build_ipv6_network.sh" ]; then
             # 如果不存在，则从指定 URL 下载并添加可执行权限
@@ -84,8 +86,8 @@ if [ -n "$7" ]; then
     fi
 fi
 if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
-    lxc config device add "$name" nattcp-ports proxy listen=tcp:0.0.0.0:$nat1-$nat2 connect=tcp:127.0.0.1:$nat1-$nat2
-    lxc config device add "$name" natudp-ports proxy listen=udp:0.0.0.0:$nat1-$nat2 connect=udp:127.0.0.1:$nat1-$nat2
+    lxc config device add "$name" nattcp-ports proxy listen=tcp:0.0.0.0:$nat1-$nat2 connect=tcp:0.0.0.0:$nat1-$nat2 nat=true
+    lxc config device add "$name" natudp-ports proxy listen=udp:0.0.0.0:$nat1-$nat2 connect=udp:0.0.0.0:$nat1-$nat2 nat=true
 fi
 # 网速
 lxc stop "$name"
@@ -106,7 +108,7 @@ fi
 if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
     echo "$name $sshn $passwd $nat1 $nat2" >"$name"
     echo "$name $sshn $passwd $nat1 $nat2"
-    exit 1
+    exit 0
 fi
 if [ "$nat1" == "0" ] && [ "$nat2" == "0" ]; then
     echo "$name $sshn $passwd" >"$name"
