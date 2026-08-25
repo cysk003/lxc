@@ -48,7 +48,7 @@ restore_ipt() {
     if [ -f /usr/local/bin/lxd_ipv6_prefix_len ]; then
         local stored_len
         stored_len=$(cat /usr/local/bin/lxd_ipv6_prefix_len)
-        if [[ "$stored_len" =~ ^[0-9]+$ ]] && [ "$stored_len" -ge 1 ] && [ "$stored_len" -le 112 ]; then
+        if [[ "$stored_len" =~ ^[0-9]+$ ]] && [ "$stored_len" -ge 1 ] && [ "$stored_len" -le 128 ]; then
             prefix_len="$stored_len"
         fi
     fi
@@ -110,7 +110,7 @@ restore_nft() {
         if [ -f /usr/local/bin/lxd_ipv6_prefix_len ]; then
             local stored_len
             stored_len=$(cat /usr/local/bin/lxd_ipv6_prefix_len)
-            if [[ "$stored_len" =~ ^[0-9]+$ ]] && [ "$stored_len" -ge 1 ] && [ "$stored_len" -le 112 ]; then
+            if [[ "$stored_len" =~ ^[0-9]+$ ]] && [ "$stored_len" -ge 1 ] && [ "$stored_len" -le 128 ]; then
                 prefix_len="$stored_len"
             fi
         fi

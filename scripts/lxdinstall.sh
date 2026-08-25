@@ -199,6 +199,51 @@ service_manager() {
     fi
 }
 
+wait_for_lxd_daemon_ready() {
+    local max_wait="${1:-120}"
+    local elapsed=0
+    while [ "$elapsed" -lt "$max_wait" ]; do
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet snap.lxd.daemon 2>/dev/null; then
+            if command -v timeout >/dev/null 2>&1; then
+                timeout 15 lxc info >/dev/null 2>&1 && return 0
+            else
+                lxc info >/dev/null 2>&1 && return 0
+            fi
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    return 1
+}
+
+restart_lxd_daemon_safely() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        service_manager restart snap.lxd.daemon
+        return $?
+    fi
+
+    # Ubuntu 24.04 with the LXD 5.21 snap can leave daemon.stop waiting
+    # forever after a reboot (the daemon repeatedly reports fanotify event 0).
+    # Queue the restart without blocking the installer, then bound the wait.
+    systemctl restart --no-block snap.lxd.daemon 2>/dev/null || true
+    if wait_for_lxd_daemon_ready 120; then
+        return 0
+    fi
+
+    _yellow "LXD daemon restart timed out; forcing the stuck stop job to recover"
+    _yellow "LXD 守护进程重启超时，正在强制恢复卡住的停止任务"
+    systemctl kill --kill-who=all --signal=SIGKILL snap.lxd.daemon 2>/dev/null || true
+    systemctl reset-failed snap.lxd.daemon 2>/dev/null || true
+    systemctl start --no-block snap.lxd.daemon 2>/dev/null || true
+    if wait_for_lxd_daemon_ready 120; then
+        return 0
+    fi
+
+    _red "LXD daemon did not become ready after forced recovery"
+    _red "强制恢复后 LXD 守护进程仍未就绪"
+    return 1
+}
+
 cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn1.spiritlhl.net/" "http://cdn2.spiritlhl.net/" "http://cdn3.spiritlhl.net/" "http://cdn4.spiritlhl.net/")
 
 set_locale() {
@@ -412,7 +457,7 @@ install_lxd() {
     snap set lxd lxcfs.loadavg=true
     snap set lxd lxcfs.pidfd=true
     snap set lxd lxcfs.cfs=true
-    service_manager restart snap.lxd.daemon
+    restart_lxd_daemon_safely || exit 1
 }
 
 configure_resources() {

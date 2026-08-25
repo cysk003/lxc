@@ -4,6 +4,181 @@
 
 # ./build_ipv6_network.sh LXC容器名称 <是否使用nft/ipt进行映射>
 
+LXD_STATE_DIR="${LXD_STATE_DIR:-/usr/local/bin}"
+
+state_file() {
+    printf '%s/%s\n' "${LXD_STATE_DIR%/}" "$1"
+}
+
+has_unsafe_scalar_chars() {
+    local value="$1"
+    [[ "$value" == *$'\n'* || "$value" == *$'\r'* || "$value" == *$'\033'* ]]
+}
+
+normalize_ipv6_address() {
+    local value="$1"
+    ! has_unsafe_scalar_chars "$value" || return 1
+    python3 - "$value" <<'PY'
+import ipaddress
+import sys
+
+try:
+    address = ipaddress.ip_address(sys.argv[1].strip().strip("[]"))
+except ValueError:
+    raise SystemExit(1)
+if address.version != 6:
+    raise SystemExit(1)
+print(address.compressed)
+PY
+}
+
+normalize_ipv6_interface() {
+    local value="$1"
+    ! has_unsafe_scalar_chars "$value" || return 1
+    python3 - "$value" <<'PY'
+import ipaddress
+import sys
+
+try:
+    interface = ipaddress.ip_interface(sys.argv[1].strip())
+except ValueError:
+    raise SystemExit(1)
+if interface.version != 6:
+    raise SystemExit(1)
+print(interface.with_prefixlen)
+PY
+}
+
+normalize_ipv6_network() {
+    local value="$1"
+    ! has_unsafe_scalar_chars "$value" || return 1
+    python3 - "$value" <<'PY'
+import ipaddress
+import sys
+
+try:
+    network = ipaddress.ip_interface(sys.argv[1].strip()).network
+except ValueError:
+    raise SystemExit(1)
+if network.version != 6:
+    raise SystemExit(1)
+print(network.with_prefixlen)
+PY
+}
+
+write_atomic_scalar() {
+    local file="$1" value="$2" dir tmp
+    [ -n "$value" ] && ! has_unsafe_scalar_chars "$value" || return 1
+    dir=${file%/*}
+    [ "$dir" != "$file" ] || dir=.
+    mkdir -p "$dir" || return 1
+    tmp=$(mktemp "${file}.tmp.XXXXXX") || return 1
+    if ! printf '%s\n' "$value" >"$tmp" || ! chmod 0644 "$tmp" || ! mv -f "$tmp" "$file"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+read_strict_ipv6_file() {
+    local file="$1" value line_count
+    [ -f "$file" ] || return 1
+    line_count=$(awk 'END { print NR + 0 }' "$file" 2>/dev/null) || return 1
+    [ "$line_count" -eq 1 ] || return 1
+    IFS= read -r value <"$file" || [ -n "$value" ] || return 1
+    normalize_ipv6_address "$value"
+}
+
+select_ipv6_interface() {
+    local preferred_address="${1:-}" candidates="${2:-}"
+    ! has_unsafe_scalar_chars "$preferred_address" || return 1
+    python3 - "$preferred_address" "$candidates" <<'PY'
+import ipaddress
+import sys
+
+preferred = sys.argv[1].strip()
+values = []
+for raw in sys.argv[2].splitlines():
+    try:
+        interface = ipaddress.ip_interface(raw.strip())
+    except ValueError:
+        continue
+    if interface.version != 6:
+        continue
+    if preferred and interface.ip.compressed == preferred:
+        print(interface.with_prefixlen)
+        raise SystemExit(0)
+    values.append(interface)
+if values:
+    print(values[0].with_prefixlen)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+random_ipv6_candidate() {
+    local network="$1" excluded="${2:-}"
+    python3 - "$network" "$excluded" <<'PY'
+import ipaddress
+import secrets
+import sys
+
+try:
+    network = ipaddress.ip_network(sys.argv[1].strip(), strict=False)
+    excluded = ipaddress.ip_address(sys.argv[2]) if sys.argv[2] else None
+except ValueError:
+    raise SystemExit(1)
+if network.version != 6:
+    raise SystemExit(1)
+available = network.num_addresses - (1 if excluded in network else 0)
+if available < 1:
+    raise SystemExit(1)
+for _ in range(256):
+    candidate = ipaddress.ip_address(int(network.network_address) + secrets.randbelow(network.num_addresses))
+    if candidate != excluded:
+        print(candidate.compressed)
+        raise SystemExit(0)
+for candidate in network:
+    if candidate != excluded:
+        print(candidate.compressed)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+generate_ipv6_candidates() {
+    local network="$1" limit="${2:-65533}"
+    python3 - "$network" "$limit" <<'PY'
+import ipaddress
+import sys
+
+try:
+    network = ipaddress.ip_network(sys.argv[1].strip(), strict=False)
+    limit = int(sys.argv[2])
+except (ValueError, IndexError):
+    raise SystemExit(1)
+if network.version != 6 or limit < 1:
+    raise SystemExit(1)
+for offset in range(min(limit, network.num_addresses)):
+    print(ipaddress.ip_address(int(network.network_address) + offset).compressed)
+PY
+}
+
+get_container_ipv6() {
+    local container_name="$1" value
+    value=$(lxc list "$container_name" --format=json | jq -er '
+        [.[0].state.network.eth0.addresses[]? | select(.family == "inet6" and .scope == "global") | .address]
+        | unique
+        | if length == 1 then .[0] else error("expected exactly one global IPv6 address") end
+    ') || return 1
+    normalize_ipv6_address "$value"
+}
+
+get_host_ipv6_interface() {
+    local raw
+    raw=$(ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}')
+    select_ipv6_interface "" "$raw"
+}
+
 # 检测防火墙后端：优先nftables，回退iptables
 detect_firewall_backend() {
     FW_BACKEND=""
@@ -196,20 +371,26 @@ is_private_ipv6() {
 
 # 获取公网IPv6地址
 check_ipv6() {
-    IPV6=$(ip -6 addr show | grep global | awk '{print length, $2}' | sort -nr | head -n 1 | awk '{print $2}' | cut -d '/' -f1)
+    local candidate response p state_path
+    state_path=$(state_file lxd_check_ipv6)
+    candidate=$(ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}' | head -n 1 | cut -d '/' -f1)
+    IPV6=$(normalize_ipv6_address "$candidate" 2>/dev/null || true)
     if is_private_ipv6 "$IPV6"; then
         IPV6=""
         API_NET=("ipv6.ip.sb" "https://ipget.net" "ipv6.ping0.cc" "https://api.my-ip.io/ip" "https://ipv6.icanhazip.com")
         for p in "${API_NET[@]}"; do
-            response=$(curl -sLk6m8 "$p" | tr -d '[:space:]')
-            if [ $? -eq 0 ] && ! (echo "$response" | grep -q "error"); then
-                IPV6="$response"
+            response=$(curl -sLk6m8 "$p") || response=""
+            candidate=$(normalize_ipv6_address "$response" 2>/dev/null || true)
+            if [ -n "$candidate" ] && ! is_private_ipv6 "$candidate"; then
+                IPV6="$candidate"
                 break
             fi
             sleep 1
         done
     fi
-    echo "$IPV6" >/usr/local/bin/lxd_check_ipv6
+    [ -n "$IPV6" ] || return 1
+    write_atomic_scalar "$state_path" "$IPV6"
+    printf '%s\n' "$IPV6"
 }
 
 # 更新系统配置参数
@@ -275,54 +456,31 @@ wait_for_container_status() {
 
 # 使用网络设备方式映射IPv6
 setup_network_device_mapping() {
-    install_package sipcalc
-    if [ ! -f /usr/local/bin/lxd_check_ipv6 ] || [ ! -s /usr/local/bin/lxd_check_ipv6 ] || [ "$(sed -e '/^[[:space:]]*$/d' /usr/local/bin/lxd_check_ipv6)" = "" ]; then
-        check_ipv6
+    local ipv6_state raw_interfaces host_address
+    ipv6_state=$(state_file lxd_check_ipv6)
+    IPV6=$(read_strict_ipv6_file "$ipv6_state" 2>/dev/null || true)
+    if [ -z "$IPV6" ]; then
+        IPV6=$(check_ipv6) || return 1
     fi
-    IPV6=$(cat /usr/local/bin/lxd_check_ipv6)
     if ip -f inet6 addr | grep -q "he-ipv6"; then
         ipv6_network_name="he-ipv6"
-        ip_network_gam=$(ip -6 addr show "$ipv6_network_name" | grep -E "${IPV6}/24|${IPV6}/48|${IPV6}/64|${IPV6}/80|${IPV6}/96|${IPV6}/112" | grep global | awk '{print $2}' 2>/dev/null)
     else
         ipv6_network_name=$(get_physical_interface)
-        ip_network_gam=$(ip -6 addr show "$ipv6_network_name" | grep global | awk '{print $2}' | head -n 1)
     fi
+    raw_interfaces=$(ip -o -6 addr show dev "$ipv6_network_name" scope global 2>/dev/null | awk '{print $4}')
+    ip_network_gam=$(select_ipv6_interface "$IPV6" "$raw_interfaces" 2>/dev/null || true)
     _yellow "Local IPV6 address: $ip_network_gam"
     if [ -n "$ip_network_gam" ]; then
-        # 验证子网前缀长度 <= 112，确保有至少16位主机位用于随机分配
-        local nd_prefix_len
-        nd_prefix_len=$(echo "$ip_network_gam" | awk -F '/' '{print $2}')
-        if [ -z "$nd_prefix_len" ] || [ "$nd_prefix_len" -gt 112 ]; then
-            _red "IPv6 prefix length ${nd_prefix_len:-unknown} is too long (max 112) for address allocation"
-            _red "IPv6前缀长度 ${nd_prefix_len:-unknown} 超过112，无法为容器分配地址"
-            return 1
-        fi
         update_sysctl "net.ipv6.conf.${ipv6_network_name}.proxy_ndp=1"
         update_sysctl "net.ipv6.conf.all.forwarding=1"
         update_sysctl "net.ipv6.conf.all.proxy_ndp=1"
         sysctl_path=$(which sysctl)
         ${sysctl_path} -p
-        # 计算基于网络地址的112位前缀，避免压缩地址解析错误
-        if command -v python3 >/dev/null 2>&1; then
-            ipv6_lala=$(python3 -c "
-import ipaddress
-iface = ipaddress.ip_interface('${ip_network_gam}')
-net_addr = iface.network.network_address.exploded
-parts = net_addr.split(':')
-print(':'.join(parts[:7]) + ':')
-")
-        else
-            # 回退：sipcalc展开网络地址再取前7组
-            local nd_expanded
-            nd_expanded=$(sipcalc "${ip_network_gam}" | grep 'Expanded Address' | awk '{print $4}')
-            if [ -z "$nd_expanded" ]; then
-                _red "Cannot expand IPv6 address for NDP mapping"
-                return 1
-            fi
-            ipv6_lala=$(echo "$nd_expanded" | cut -d ':' -f1-7):
-        fi
-        randbits=$(od -An -N2 -t x1 /dev/urandom | tr -d ' \n')
-        lxc_ipv6="${ipv6_lala}${randbits}"
+        host_address=${ip_network_gam%/*}
+        lxc_ipv6=$(random_ipv6_candidate "$ip_network_gam" "$host_address") || {
+            _red "No additional IPv6 address is available in $ip_network_gam"
+            return 1
+        }
         _green "Container $CONTAINER_NAME IPV6:"
         _green "$lxc_ipv6"
         lxc stop "$CONTAINER_NAME"
@@ -338,7 +496,7 @@ print(':'.join(parts[:7]) + ':')
         lxc start "$CONTAINER_NAME"
         handle_fe80_gateway
         setup_ipv6_cron
-        echo "$lxc_ipv6" >>"$CONTAINER_NAME"_v6
+        write_atomic_scalar "${CONTAINER_NAME}_v6" "$lxc_ipv6"
     else
         _red "No host IPv6 network address found for routed mapping"
         _red "未找到宿主机 IPv6 网络地址，无法使用 routed 方式映射"
@@ -380,8 +538,7 @@ setup_firewall_mapping() {
 # 使用nftables映射IPv6
 setup_nft_mapping() {
     local found_ipv6=""
-    for ((i=3; i<=65535; i++)); do
-        IPV6="${SUBNET_PREFIX}$(printf '%x' $i)"
+    while IFS= read -r IPV6; do
         if [[ $IPV6 == "$CONTAINER_IPV6" ]]; then
             continue
         fi
@@ -396,7 +553,7 @@ setup_nft_mapping() {
             fi
         fi
         _yellow "$IPV6"
-    done
+    done < <(generate_ipv6_candidates "$IPV6_NETWORK" 65533)
     if [ -z "$found_ipv6" ]; then
         _red "No IPV6 address available, no auto mapping"
         _red "无可用 IPV6 地址，不进行自动映射"
@@ -416,15 +573,14 @@ setup_nft_mapping() {
     setup_persistence_service
     save_firewall_rules
     test_ipv6_connectivity "$IPV6"
-    echo "$IPV6" >>"$CONTAINER_NAME"_v6
+    write_atomic_scalar "${CONTAINER_NAME}_v6" "$IPV6"
 }
 
 # 使用iptables映射IPv6
 setup_ipt_mapping() {
     # 寻找未使用的子网内的一个IPV6地址
     local found_ipv6=""
-    for ((i=3; i<=65535; i++)); do
-        IPV6="${SUBNET_PREFIX}$(printf '%x' $i)"
+    while IFS= read -r IPV6; do
         if [[ $IPV6 == "$CONTAINER_IPV6" ]]; then
             continue
         fi
@@ -439,7 +595,7 @@ setup_ipt_mapping() {
             fi
         fi
         _yellow "$IPV6"
-    done
+    done < <(generate_ipv6_candidates "$IPV6_NETWORK" 65533)
     # 检查是否找到未使用的 IPV6 地址
     if [ -z "$found_ipv6" ]; then
         _red "No IPV6 address available, no auto mapping"
@@ -458,7 +614,7 @@ setup_ipt_mapping() {
     # 测试连通性
     test_ipv6_connectivity "$IPV6"
     # 写入信息
-    echo "$IPV6" >>"$CONTAINER_NAME"_v6
+    write_atomic_scalar "${CONTAINER_NAME}_v6" "$IPV6"
 }
 
 # 检测CDN
@@ -539,11 +695,15 @@ test_ipv6_connectivity() {
 }
 
 main() {
-    if [ ! -d "/usr/local/bin" ]; then
-        mkdir -p /usr/local/bin
+    if [ ! -d "$LXD_STATE_DIR" ]; then
+        mkdir -p "$LXD_STATE_DIR"
     fi
     setup_locale
     CONTAINER_NAME="$1"
+    if [[ -z "$CONTAINER_NAME" || "$CONTAINER_NAME" == *[!A-Za-z0-9_.-]* ]]; then
+        _red "Invalid LXC container name"
+        exit 1
+    fi
     use_iptables="${2:-N}"
     use_iptables=$(echo "$use_iptables" | tr '[:upper:]' '[:lower:]')
     # 安装必要的包
@@ -552,6 +712,7 @@ main() {
     install_package jq
     install_package net-tools
     install_package cron
+    install_package python3
     # 查询网卡
     interface=$(get_physical_interface)
     if [ -z "$interface" ]; then
@@ -564,7 +725,7 @@ main() {
     # 等待容器运行
     wait_for_container_status "$CONTAINER_NAME" "RUNNING" 24
     # 获取指定LXC容器的内网IPV6
-    CONTAINER_IPV6=$(lxc list "$CONTAINER_NAME" --format=json | jq -r '.[0].state.network.eth0.addresses[] | select(.family=="inet6") | select(.scope=="global") | .address')
+    CONTAINER_IPV6=$(get_container_ipv6 "$CONTAINER_NAME" 2>/dev/null || true)
     if [ -z "$CONTAINER_IPV6" ]; then
         _red "Container has no intranet IPV6 address, no auto-mapping"
         _red "容器无内网IPV6地址，不进行自动映射"
@@ -573,7 +734,7 @@ main() {
     _blue "The container with the name $CONTAINER_NAME has an intranet IPV6 address of $CONTAINER_IPV6"
     _blue "$CONTAINER_NAME 容器的内网IPV6地址为 $CONTAINER_IPV6"
     # 获取宿主机的IPV6地址（含CIDR）
-    ipv6_address=$(ip -6 addr show | grep -E 'inet6.*global' | awk '{print $2}' | head -n 1)
+    ipv6_address=$(get_host_ipv6_interface 2>/dev/null || true)
     if [[ $ipv6_address == */* ]]; then
         ipv6_length=$(echo "$ipv6_address" | awk -F '/' '{ print $2 }')
         _green "subnet size: $ipv6_length"
@@ -583,32 +744,16 @@ main() {
         _green "查询不到IPV6的子网大小"
         exit 1
     fi
-    # 验证子网前缀长度，必须 <= 112 以确保最后16位可用于地址枚举
-    if [ "$ipv6_length" -gt 112 ]; then
-        _red "IPv6 subnet prefix length $ipv6_length exceeds 112, cannot enumerate addresses (need at least 16 host bits)"
-        _red "IPv6子网前缀长度 $ipv6_length 超过112，无法枚举地址（需要至少16位主机位）"
+    if ! [[ "$ipv6_length" =~ ^[0-9]+$ ]] || [ "$ipv6_length" -lt 1 ] || [ "$ipv6_length" -gt 128 ]; then
+        _red "Invalid IPv6 subnet prefix length: $ipv6_length"
+        _red "无效的IPv6子网前缀长度: $ipv6_length"
         exit 1
     fi
-    # 将前缀长度持久化，供 add-ipv6.sh 重启恢复时使用
-    echo "$ipv6_length" > /usr/local/bin/lxd_ipv6_prefix_len
-    # 计算正确的子网网络前缀（基于网络地址前112位，避免压缩地址解析错误）
-    if command -v python3 >/dev/null 2>&1; then
-        SUBNET_PREFIX=$(python3 -c "
-import ipaddress
-iface = ipaddress.ip_interface('${ipv6_address}')
-net_addr = iface.network.network_address.exploded
-parts = net_addr.split(':')
-print(':'.join(parts[:7]) + ':')
-")
-    else
-        # 回退：使用 sipcalc 展开地址后取前7组
-        expanded=$(sipcalc "${ipv6_address}" | grep 'Expanded Address' | awk '{print $4}')
-        if [ -z "$expanded" ]; then
-            _red "Cannot expand IPv6 address: python3 and sipcalc unavailable"
-            exit 1
-        fi
-        SUBNET_PREFIX=$(echo "$expanded" | cut -d ':' -f1-7):
-    fi
+    write_atomic_scalar "$(state_file lxd_ipv6_prefix_len)" "$ipv6_length" || exit 1
+    IPV6_NETWORK=$(normalize_ipv6_network "$ipv6_address") || {
+        _red "Cannot parse host IPv6 network: $ipv6_address"
+        exit 1
+    }
     # fe80检测
     output=$(ip -6 route show | awk '/default via/{print $3}')
     num_lines=$(echo "$output" | wc -l)
@@ -630,13 +775,13 @@ print(':'.join(parts[:7]) + ':')
         ipv6_gateway_fe80="N"
     fi
     # 检查是否存在 IPV6
-    if [ -z "$SUBNET_PREFIX" ]; then
+    if [ -z "$IPV6_NETWORK" ]; then
         _red "No IPV6 subnet, no automatic mapping"
         _red "无 IPV6 子网，不进行自动映射"
         exit 1
     fi
-    _blue "The IPV6 subnet prefix is $SUBNET_PREFIX"
-    _blue "宿主机的IPV6子网前缀为 $SUBNET_PREFIX"
+    _blue "The IPV6 subnet is $IPV6_NETWORK"
+    _blue "宿主机的IPV6子网为 $IPV6_NETWORK"
     # 根据选项决定映射方式
     if [[ $use_iptables == n ]]; then
         setup_network_device_mapping || exit 1
@@ -647,4 +792,6 @@ print(':'.join(parts[:7]) + ':')
     fi
 }
 
-main "$@"
+if [ "${ONECLICKVIRT_TESTING:-0}" != "1" ]; then
+    main "$@"
+fi
