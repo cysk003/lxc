@@ -7,7 +7,7 @@ export LXD_STATE_DIR
 LXD_STATE_DIR=$(mktemp -d)
 trap 'rm -rf "$LXD_STATE_DIR"' EXIT
 
-# shellcheck source=../scripts/build_ipv6_network.sh
+# shellcheck disable=SC1091 # The test sources the repository script through a computed path.
 source "$ROOT_DIR/scripts/build_ipv6_network.sh"
 
 fail() {
