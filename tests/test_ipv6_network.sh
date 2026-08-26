@@ -85,5 +85,9 @@ unset LXD_TEST_NO_LOCAL_IPV6
 if ! grep -Fq 'net.ipv6.conf.${ipv6_network_name}.accept_ra=2' "$repo_root/scripts/build_ipv6_network.sh"; then
     fail "IPv6 forwarding must preserve router advertisements on the LXD uplink"
 fi
+# shellcheck disable=SC2016 # The literal is the source-code contract under test.
+if grep -Fq 'net.ipv6.conf.all.proxy_ndp=1' "$repo_root/scripts/build_ipv6_network.sh"; then
+    fail "LXD must not enable NDP proxying globally"
+fi
 
 printf 'LXD IPv6 local-address tests passed\n'
