@@ -57,6 +57,31 @@ if check_ipv6 >/dev/null 2>&1; then
 fi
 [[ ! -e "$LXD_TEST_CURL_MARKER" ]] || fail "missing local IPv6 triggered an external lookup"
 
+# The same address can be a host-only /128 on the uplink and a delegated /38
+# on a direct bridge. Retain the bridge, not the first matching /128.
+# shellcheck disable=SC2329 # Called indirectly by the sourced network helpers.
+ip() {
+    case "$*" in
+        "-o -6 addr show scope global")
+            printf '%s\n' \
+                '3: vmbr0    inet6 2a14:7c0:1002:10f8::1/128 scope global' \
+                '5: vmbr2    inet6 2a14:7c0:1002:10f8::1/38 scope global'
+            ;;
+        "-o -6 addr show dev vmbr2 scope global")
+            printf '%s\n' '5: vmbr2    inet6 2a14:7c0:1002:10f8::1/38 scope global'
+            ;;
+        *)
+            command ip "$@"
+            ;;
+    esac
+}
+check_ipv6 >/dev/null || fail "delegated /38 was not accepted"
+[[ "$IPV6" == "2a14:7c0:1002:10f8::1" ]] || fail "delegated /38 selection = '$IPV6'"
+[[ "$(ipv6_uplink_interface "$IPV6")" == "vmbr2" ]] || fail "delegated /38 interface was not selected"
+unset -f ip
+unset LXD_TEST_NO_LOCAL_IPV6
+
+# shellcheck disable=SC2016 # The literal is the source-code contract under test.
 if ! grep -Fq 'net.ipv6.conf.${ipv6_network_name}.accept_ra=2' "$repo_root/scripts/build_ipv6_network.sh"; then
     fail "IPv6 forwarding must preserve router advertisements on the LXD uplink"
 fi
