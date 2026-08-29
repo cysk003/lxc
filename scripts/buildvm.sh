@@ -1,7 +1,73 @@
 #!/usr/bin/env bash
 # from
 # https://github.com/oneclickvirt/lxd
-# 2026.02.28
+# 2026.08.30
+
+# Remove only a VM that this invocation created when a later step fails.  This
+# prevents a failed creation from being reported as a running VM while keeping
+# an existing VM with the requested name untouched.
+created_instance=false
+build_succeeded=false
+cleanup_failed_instance() {
+    local status=$?
+    if [ "$created_instance" = true ] && [ "$build_succeeded" != true ] && [ -n "${name:-}" ] && command -v lxc >/dev/null 2>&1; then
+        lxc delete --force "$name" >/dev/null 2>&1 || true
+    fi
+    return "$status"
+}
+
+create_instance_with_tracking() {
+    local init_status
+    "$@"
+    init_status=$?
+    if [ "$init_status" -eq 0 ]; then
+        created_instance=true
+        return 0
+    fi
+    if lxc info "$name" >/dev/null 2>&1; then
+        created_instance=true
+    fi
+    return "$init_status"
+}
+if [[ "${ONECLICKVIRT_TESTING:-}" != "1" ]]; then
+    trap cleanup_failed_instance EXIT
+fi
+
+lxd_storage_pool() {
+    local pool_name="${LXD_STORAGE_POOL:-}"
+    if [ -z "$pool_name" ] && [ -r /usr/local/bin/lxd_storage_pool ]; then
+        IFS= read -r pool_name </usr/local/bin/lxd_storage_pool || true
+    fi
+    [[ "$pool_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || pool_name="default"
+    printf '%s\n' "$pool_name"
+}
+
+run_lxc_probe() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 15 lxc "$@"
+    else
+        lxc "$@"
+    fi
+}
+
+ensure_lxd_ready() {
+    storage_pool="$(lxd_storage_pool)"
+    if ! command -v lxc >/dev/null 2>&1; then
+        echo "Error: LXD is not installed or not in PATH." >&2
+        echo "错误：LXD 未安装或不在 PATH 中。" >&2
+        return 1
+    fi
+    if ! run_lxc_probe info >/dev/null 2>&1; then
+        echo "Error: LXD is not initialized; run lxdinstall.sh successfully first." >&2
+        echo "错误：LXD 尚未初始化，请先成功运行 lxdinstall.sh。" >&2
+        return 1
+    fi
+    if ! run_lxc_probe storage show "$storage_pool" >/dev/null 2>&1; then
+        echo "Error: LXD storage pool '$storage_pool' is unavailable." >&2
+        echo "错误：LXD 存储池 '$storage_pool' 不可用。" >&2
+        return 1
+    fi
+}
 
 
 check_vm_support() {
@@ -10,7 +76,7 @@ check_vm_support() {
     if ! command -v lxc >/dev/null 2>&1; then
         echo "Error: LXD is not installed or not in PATH"
         echo "错误：LXD未安装或不在PATH中"
-        exit 1
+        return 1
     fi
     local drivers
     drivers=$(lxc info | grep -i "driver:")
@@ -21,7 +87,7 @@ check_vm_support() {
         echo "错误：LXD不支持虚拟机（未找到qemu驱动）"
         echo "Only LXC containers are supported on this system"
         echo "此系统仅支持LXC容器"
-        exit 1
+        return 1
     fi
     # Detect KVM hardware acceleration vs QEMU TCG software emulation
     if [ -e /dev/kvm ]; then
@@ -276,32 +342,32 @@ validate_inputs() {
     if ! validate_instance_name "$name"; then
         echo "Error: VM name must not be empty, start with '-', or contain '/'."
         echo "错误：虚拟机名称不能为空，不能以 '-' 开头，也不能包含 '/'。"
-        exit 1
+        return 1
     fi
     if ! validate_positive_int "$cpu" || ! validate_positive_int "$memory" || ! validate_positive_int "$in" || ! validate_positive_int "$out"; then
         echo "Error: CPU, memory and speed values must be positive integers."
         echo "错误：CPU、内存和网速参数必须是正整数。"
-        exit 1
+        return 1
     fi
     if ! validate_positive_number "$disk"; then
         echo "Error: disk size must be a positive number."
         echo "错误：硬盘大小必须是正数。"
-        exit 1
+        return 1
     fi
     if ! validate_positive_port "$sshn" || ! validate_port "$nat1" || ! validate_port "$nat2"; then
         echo "Error: ports must be integers in range 0-65535, and SSH port must be greater than 0."
         echo "错误：端口必须是 0-65535 的整数，SSH 端口必须大于 0。"
-        exit 1
+        return 1
     fi
     if { [ "$nat1" = "0" ] && [ "$nat2" != "0" ]; } || { [ "$nat1" != "0" ] && [ "$nat2" = "0" ]; }; then
         echo "Error: NAT port range must either be both 0 or both non-zero."
         echo "错误：NAT 端口起止必须同时为 0，或同时为非 0。"
-        exit 1
+        return 1
     fi
     if [ "$nat1" != "0" ] && [ "$nat2" != "0" ] && [ "$nat1" -gt "$nat2" ]; then
         echo "Error: NAT start port cannot be greater than NAT end port."
         echo "错误：NAT 起始端口不能大于结束端口。"
-        exit 1
+        return 1
     fi
 }
 
@@ -328,7 +394,7 @@ download_host_file() {
     if ! curl -fsSLk "${cdn_success_url}${url}" -o "$output"; then
         echo "Failed to download: $url"
         echo "下载失败：$url"
-        exit 1
+        return 1
     fi
 }
 
@@ -446,7 +512,7 @@ handle_image() {
         if [ ${#kvm_images[@]} -eq 0 ]; then
             echo "Failed to get KVM images list"
             echo "获取KVM镜像列表失败"
-            exit 1
+            return 1
         fi
         local target_images=()
         local cloud_images=()
@@ -479,7 +545,7 @@ handle_image() {
             image_alias_output=$(lxc image alias list)
             local short_alias="${a}${b}"
             if [[ "$image_alias_output" != *"$short_alias"* ]]; then
-                import_image "$selected_image" "$image_download_url"
+                import_image "$selected_image" "$image_download_url" || return 1
                 echo "A matching image exists and will be created using ${image_download_url}"
                 echo "匹配的镜像存在，将使用 ${image_download_url} 进行创建"
             else
@@ -488,7 +554,7 @@ handle_image() {
         fi
     fi
     if [ -z "$image_download_url" ]; then
-        check_standard_images
+        check_standard_images || return 1
     fi
 }
 
@@ -505,21 +571,21 @@ import_image() {
     if ! retry_wget "${cdn_success_url}${image_url}" "$image_name"; then
         echo "Failed to download image: $image_url"
         echo "镜像下载失败：$image_url"
-        exit 1
+        return 1
     fi
     chmod 777 "$image_name"
     if ! unzip "$image_name"; then
         rm -f -- "$image_name"
         echo "Failed to unzip image: $image_name"
         echo "镜像解压失败：$image_name"
-        exit 1
+        return 1
     fi
     rm -f -- "$image_name"
     if ! lxc image import lxd.tar.xz disk.qcow2 --alias "$short_alias"; then
         rm -f -- lxd.tar.xz disk.qcow2
         echo "Failed to import image: $short_alias"
         echo "镜像导入失败：$short_alias"
-        exit 1
+        return 1
     fi
     rm -f -- lxd.tar.xz disk.qcow2
     system="$short_alias"
@@ -549,79 +615,102 @@ check_standard_images() {
         echo "未找到匹配的镜像，请执行"
         echo "lxc image list images:系统/版本号 或 lxc image list opsmaru:系统/版本号"
         echo "查询是否存在对应镜像"
-        exit 1
+        return 1
     fi
 }
 
 create_vm() {
-    rm -f -- "$name"
+    if lxc info "$name" >/dev/null 2>&1; then
+        echo "Error: an instance named '$name' already exists." >&2
+        echo "错误：名为 '$name' 的实例已存在。" >&2
+        return 1
+    fi
+    rm -f -- "$name" || return 1
     disk_size=$(format_disk_size)
     if [ -z "$image_download_url" ] && [ "$status_tuna" = true ]; then
-        lxc init "opsmaru:${system}" "$name" --vm -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -d root,size="$disk_size" -s default
+        if ! create_instance_with_tracking lxc init "opsmaru:${system}" "$name" --vm -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -d root,size="$disk_size" -s "${storage_pool:-default}"; then
+            echo "VM creation failed, please check the previous output message" >&2
+            echo "虚拟机创建失败，请检查前面的输出信息" >&2
+            return 1
+        fi
     elif [ -z "$image_download_url" ]; then
-        lxc init "images:${system}" "$name" --vm -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -d root,size="$disk_size" -s default
+        if ! create_instance_with_tracking lxc init "images:${system}" "$name" --vm -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -d root,size="$disk_size" -s "${storage_pool:-default}"; then
+            echo "VM creation failed, please check the previous output message" >&2
+            echo "虚拟机创建失败，请检查前面的输出信息" >&2
+            return 1
+        fi
     else
-        lxc init "$system" "$name" --vm -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -d root,size="$disk_size" -s default
+        if ! create_instance_with_tracking lxc init "$system" "$name" --vm -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -d root,size="$disk_size" -s "${storage_pool:-default}"; then
+            echo "VM creation failed, please check the previous output message" >&2
+            echo "虚拟机创建失败，请检查前面的输出信息" >&2
+            return 1
+        fi
     fi
-    if [ $? -ne 0 ]; then
-        echo "VM creation failed, please check the previous output message"
-        echo "虚拟机创建失败，请检查前面的输出信息"
-        exit 1
+    if ! lxc info "$name" >/dev/null 2>&1; then
+        echo "VM creation did not produce instance '$name'." >&2
+        echo "虚拟机创建后未找到实例 '$name'。" >&2
+        return 1
     fi
 }
 
 configure_limits() {
-    lxc config set "$name" security.secureboot false || true
+    lxc config set "$name" security.secureboot false || return 1
 }
 
 setup_vm() {
     ori=$(date | md5sum)
     passwd=${ori:2:9}
-    lxc start "$name"
+    if ! lxc start "$name"; then
+        echo "VM start failed: $name" >&2
+        echo "虚拟机启动失败：$name" >&2
+        return 1
+    fi
     echo "Waiting for VM to start..."
     sleep 30
     max_retries=10
+    local vm_ready=false
     for ((i=1; i<=max_retries; i++)); do
         echo "Attempt $i: Waiting for VM to be ready..."
         if lxc exec "$name" -- echo "VM is ready" 2>/dev/null; then
+            vm_ready=true
             break
         fi
         sleep 10
     done
-    chmod 777 /usr/local/bin/check-dns.sh
-    /usr/local/bin/check-dns.sh
+    if [ "$vm_ready" != true ]; then
+        echo "Error: VM did not become ready for configuration." >&2
+        echo "错误：虚拟机未就绪，已中止配置。" >&2
+        return 1
+    fi
+    chmod 777 /usr/local/bin/check-dns.sh || return 1
+    /usr/local/bin/check-dns.sh || return 1
     sleep 3
     if [ "$fixed_system" = false ]; then
-        setup_mirror_and_packages
+        setup_mirror_and_packages || return 1
     fi
-    setup_ssh
+    setup_ssh || return 1
 }
 
 setup_mirror_and_packages() {
     if [[ "${CN}" == true ]]; then
-        lxc exec "$name" -- yum install -y curl
-        lxc exec "$name" -- apt-get install curl -y --fix-missing
-        lxc exec "$name" -- curl -lk https://gitee.com/SuperManito/LinuxMirrors/raw/main/ChangeMirrors.sh -o ChangeMirrors.sh
-        lxc exec "$name" -- chmod 777 ChangeMirrors.sh
-        lxc exec "$name" -- ./ChangeMirrors.sh --source mirrors.tuna.tsinghua.edu.cn --web-protocol http --intranet false --backup true --updata-software false --clean-cache false --ignore-backup-tips >/dev/null
-        lxc exec "$name" -- rm -f -- ChangeMirrors.sh
+        lxc exec "$name" -- sh -c 'if command -v yum >/dev/null 2>&1; then yum install -y curl; fi' || return 1
+        lxc exec "$name" -- sh -c 'if command -v apt-get >/dev/null 2>&1; then apt-get install curl -y --fix-missing; fi' || return 1
+        lxc exec "$name" -- curl -fLk https://gitee.com/SuperManito/LinuxMirrors/raw/main/ChangeMirrors.sh -o ChangeMirrors.sh || return 1
+        lxc exec "$name" -- chmod 777 ChangeMirrors.sh || return 1
+        lxc exec "$name" -- ./ChangeMirrors.sh --source mirrors.tuna.tsinghua.edu.cn --web-protocol http --intranet false --backup true --updata-software false --clean-cache false --ignore-backup-tips >/dev/null || return 1
+        lxc exec "$name" -- rm -f -- ChangeMirrors.sh || return 1
     fi
     if echo "$system" | grep -qiE "centos|almalinux|fedora|rocky|oracle"; then
-        lxc exec "$name" -- sudo yum update -y
-        lxc exec "$name" -- sudo yum install -y curl
-        lxc exec "$name" -- sudo yum install -y dos2unix
+        lxc exec "$name" -- sudo yum update -y || return 1
+        lxc exec "$name" -- sudo yum install -y curl dos2unix || return 1
     elif echo "$system" | grep -qiE "alpine"; then
-        lxc exec "$name" -- apk update
-        lxc exec "$name" -- apk add --no-cache curl
+        lxc exec "$name" -- apk update || return 1
+        lxc exec "$name" -- apk add --no-cache curl || return 1
     elif echo "$system" | grep -qiE "archlinux"; then
-        lxc exec "$name" -- pacman -Sy
-        lxc exec "$name" -- pacman -Sy --noconfirm --needed curl
-        lxc exec "$name" -- pacman -Sy --noconfirm --needed dos2unix
-        lxc exec "$name" -- pacman -Sy --noconfirm --needed bash
+        lxc exec "$name" -- pacman -Sy --noconfirm --needed curl dos2unix bash || return 1
     else
-        lxc exec "$name" -- sudo apt-get update -y
-        lxc exec "$name" -- sudo apt-get install curl -y --fix-missing
-        lxc exec "$name" -- sudo apt-get install dos2unix -y --fix-missing
+        lxc exec "$name" -- sudo apt-get update -y || return 1
+        lxc exec "$name" -- sudo apt-get install curl dos2unix -y --fix-missing || return 1
     fi
 }
 
@@ -631,26 +720,26 @@ setup_ssh() {
 
 setup_ssh_bash() {
     if [ ! -f /usr/local/bin/ssh_bash.sh ]; then
-        download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh" /usr/local/bin/ssh_bash.sh
-        chmod 777 /usr/local/bin/ssh_bash.sh
-        dos2unix /usr/local/bin/ssh_bash.sh
+        download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh" /usr/local/bin/ssh_bash.sh || return 1
+        chmod 777 /usr/local/bin/ssh_bash.sh || return 1
+        dos2unix /usr/local/bin/ssh_bash.sh || return 1
     fi
-    cp /usr/local/bin/ssh_bash.sh /root
-    lxc file push /root/ssh_bash.sh "$name"/root/
-    lxc exec "$name" -- chmod 777 ssh_bash.sh
-    lxc exec "$name" -- dos2unix ssh_bash.sh
-    lxc exec "$name" -- sudo ./ssh_bash.sh "$passwd"
+    cp /usr/local/bin/ssh_bash.sh /root || return 1
+    lxc file push /root/ssh_bash.sh "$name"/root/ || return 1
+    lxc exec "$name" -- chmod 777 ssh_bash.sh || return 1
+    lxc exec "$name" -- dos2unix ssh_bash.sh || return 1
+    lxc exec "$name" -- sudo ./ssh_bash.sh "$passwd" || return 1
     if [ ! -f /usr/local/bin/config.sh ]; then
-        download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh" /usr/local/bin/config.sh
-        chmod 777 /usr/local/bin/config.sh
-        dos2unix /usr/local/bin/config.sh
+        download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh" /usr/local/bin/config.sh || return 1
+        chmod 777 /usr/local/bin/config.sh || return 1
+        dos2unix /usr/local/bin/config.sh || return 1
     fi
-    cp /usr/local/bin/config.sh /root
-    lxc file push /root/config.sh "$name"/root/
-    lxc exec "$name" -- chmod +x config.sh
-    lxc exec "$name" -- dos2unix config.sh
-    lxc exec "$name" -- bash config.sh
-    lxc exec "$name" -- history -c
+    cp /usr/local/bin/config.sh /root || return 1
+    lxc file push /root/config.sh "$name"/root/ || return 1
+    lxc exec "$name" -- chmod +x config.sh || return 1
+    lxc exec "$name" -- dos2unix config.sh || return 1
+    lxc exec "$name" -- bash config.sh || return 1
+    lxc exec "$name" -- history -c || return 1
 }
 
 wait_for_vm_ready_to_shutdown() {
@@ -681,7 +770,10 @@ wait_for_vm_ready_to_shutdown() {
 safe_shutdown_vm() {
     echo "Safely shutting down VM..."
     echo "正在安全关闭虚拟机..."
-    lxc stop "$name" --timeout=30
+    if ! lxc stop "$name" --timeout=30; then
+        echo "Error: failed to stop VM '$name'." >&2
+        return 1
+    fi
     local max_shutdown_wait=30
     local waited=0
     while [ "$waited" -lt "$max_shutdown_wait" ]; do
@@ -697,13 +789,13 @@ safe_shutdown_vm() {
         echo "Waiting for VM to stop... (${waited}/${max_shutdown_wait}s)"
         echo "等待虚拟机停止... (${waited}/${max_shutdown_wait}秒)"
     done
-    echo "Warning: VM shutdown timeout, but continuing configuration process..."
-    echo "警告：虚拟机停止超时，但继续配置流程..."
+    echo "Error: VM stop timed out; aborting configuration." >&2
+    echo "错误：虚拟机停止超时，已中止配置。" >&2
     return 1
 }
 
 configure_network() {
-    lxc restart "$name"
+    lxc restart "$name" || return 1
     echo "Waiting for the VM to start. Attempting to retrieve the VM's IP address..."
     echo "等待虚拟机启动，尝试获取虚拟机IP地址..."
     max_retries=5
@@ -728,8 +820,7 @@ configure_network() {
     if [[ -z "$vm_ip" ]]; then
         echo "Error: VM failed to start or no IP address was assigned."
         echo "错误：虚拟机启动失败或未分配IP地址"
-        lxc delete --force "$name" 2>/dev/null || true
-        exit 1
+        return 1
     fi
     ipv4_address=$(ip addr show | awk '/inet .*global/ && !/inet6/ {print $2}' | sed -n '1p' | cut -d/ -f1)
     echo "Host IPv4 address: $ipv4_address"
@@ -738,22 +829,22 @@ configure_network() {
         if [ "$enable_ipv6" == "y" ]; then
             echo "Configuring IPv6..."
             echo "配置IPv6..."
-            ensure_container_ipv6_cron
+            ensure_container_ipv6_cron || return 1
             sleep 1
             if [ ! -f "./build_ipv6_network.sh" ]; then
-                download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/build_ipv6_network.sh" build_ipv6_network.sh
-                chmod +x build_ipv6_network.sh
+                download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/build_ipv6_network.sh" build_ipv6_network.sh || return 1
+                chmod +x build_ipv6_network.sh || return 1
             fi
-            ./build_ipv6_network.sh "$name"
+            ./build_ipv6_network.sh "$name" || return 1
         fi
     fi
     configure_firewall_ports
     wait_for_vm_ready_to_shutdown
-    safe_shutdown_vm
-    configure_network_limits
-    set_ip_address_binding "$vm_ip"
-    configure_port_mapping "$vm_ip" "$ipv4_address"
-    lxc start "$name"
+    safe_shutdown_vm || return 1
+    configure_network_limits || return 1
+    set_ip_address_binding "$vm_ip" || return 1
+    configure_port_mapping "$vm_ip" "$ipv4_address" || return 1
+    lxc start "$name" || return 1
     echo "Network configuration completed successfully!"
     echo "网络配置成功完成！"
 }
@@ -789,9 +880,9 @@ configure_network_limits() {
     if ! lxc config device override "$name" enp5s0 limits.egress="$out"Mbit limits.ingress="$in"Mbit limits.max="$speed_limit"Mbit 2>/dev/null; then
         echo "Failed to configure enp5s0, trying eth0..."
         if ! lxc config device override "$name" eth0 limits.egress="$out"Mbit limits.ingress="$in"Mbit limits.max="$speed_limit"Mbit 2>/dev/null; then
-            lxc config device set "$name" eth0 limits.egress "$out"Mbit
-            lxc config device set "$name" eth0 limits.ingress "$in"Mbit
-            lxc config device set "$name" eth0 limits.max "$speed_limit"Mbit
+            lxc config device set "$name" eth0 limits.egress "$out"Mbit || return 1
+            lxc config device set "$name" eth0 limits.ingress "$in"Mbit || return 1
+            lxc config device set "$name" eth0 limits.max "$speed_limit"Mbit || return 1
         fi
     fi
 }
@@ -804,8 +895,9 @@ set_ip_address_binding() {
         if ! lxc config device override "$name" enp5s0 ipv4.address="$vm_ip" 2>/dev/null; then
             if ! lxc config device set "$name" eth0 ipv4.address "$vm_ip" 2>/dev/null; then
                 if ! lxc config device override "$name" eth0 ipv4.address="$vm_ip" 2>/dev/null; then
-                    echo "Warning: Failed to bind IP address, continuing anyway..."
-                    echo "警告：IP地址绑定失败，继续执行..."
+                    echo "Error: Failed to bind IP address in VM '$name'." >&2
+                    echo "错误：虚拟机 '$name' 的IP地址绑定失败。" >&2
+                    return 1
                 fi
             fi
         fi
@@ -818,12 +910,12 @@ configure_port_mapping() {
     echo "Configuring port mapping..."
     echo "配置端口映射..."
     echo "Adding SSH port mapping: $host_ip:$sshn -> $vm_ip:22"
-    replace_proxy_device ssh-port "listen=tcp:$host_ip:$sshn" "connect=tcp:$vm_ip:22" nat=true
+    replace_proxy_device ssh-port "listen=tcp:$host_ip:$sshn" "connect=tcp:$vm_ip:22" nat=true || return 1
     if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
         echo "Adding NAT TCP port mapping: $host_ip:$nat1-$nat2 -> $vm_ip:$nat1-$nat2"
-        replace_proxy_device nattcp-ports "listen=tcp:$host_ip:$nat1-$nat2" "connect=tcp:$vm_ip:$nat1-$nat2" nat=true
+        replace_proxy_device nattcp-ports "listen=tcp:$host_ip:$nat1-$nat2" "connect=tcp:$vm_ip:$nat1-$nat2" nat=true || return 1
         echo "Adding NAT UDP port mapping: $host_ip:$nat1-$nat2 -> $vm_ip:$nat1-$nat2"
-        replace_proxy_device natudp-ports "listen=udp:$host_ip:$nat1-$nat2" "connect=udp:$vm_ip:$nat1-$nat2" nat=true
+        replace_proxy_device natudp-ports "listen=udp:$host_ip:$nat1-$nat2" "connect=udp:$vm_ip:$nat1-$nat2" nat=true || return 1
     else
         remove_device_if_exists nattcp-ports
         remove_device_if_exists natudp-ports
@@ -832,19 +924,25 @@ configure_port_mapping() {
 
 cleanup_and_finish() {
     rm -f -- ssh_bash.sh config.sh ssh_sh.sh
+    local record record_tmp
     if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
-        echo "$name $sshn $passwd $nat1 $nat2" >>"$name"
-        echo "$name $sshn $passwd $nat1 $nat2"
-        exit 0
+        record="$name $sshn $passwd $nat1 $nat2"
+    elif [ "$nat1" == "0" ] && [ "$nat2" == "0" ]; then
+        record="$name $sshn $passwd"
+    else
+        return 1
     fi
-    if [ "$nat1" == "0" ] && [ "$nat2" == "0" ]; then
-        echo "$name $sshn $passwd" >>"$name"
-        echo "$name $sshn $passwd"
+    record_tmp="${name}.tmp.$$"
+    if ! printf '%s\n' "$record" >"$record_tmp" || ! mv -f -- "$record_tmp" "$name"; then
+        rm -f -- "$record_tmp"
+        return 1
     fi
+    printf '%s\n' "$record"
+    return 0
 }
 
 main() {
-    check_vm_support
+    check_vm_support || return 1
     name="${1:-test}"
     cpu="${2:-1}"
     memory="${3:-512}"
@@ -857,24 +955,28 @@ main() {
     enable_ipv6="${10:-N}"
     enable_ipv6=$(echo "$enable_ipv6" | tr '[:upper:]' '[:lower:]')
     system="${11:-debian11}"
+    ensure_lxd_ready || return 1
     if ! normalize_image_system "$system"; then
         echo "Error: system must be a valid image name, such as debian11 or debian/11."
         echo "错误：系统名称必须有效，例如 debian11 或 debian/11。"
-        exit 1
+        return 1
     fi
     system="$normalized_system"
     detect_os
-    validate_inputs
-    install_dependencies
+    validate_inputs || return 1
+    install_dependencies || return 1
     detect_arch
     check_china
     cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn1.spiritlhl.net/" "http://cdn2.spiritlhl.net/" "http://cdn3.spiritlhl.net/" "http://cdn4.spiritlhl.net/")
     check_cdn_file
-    handle_image
-    create_vm
-    configure_limits
-    setup_vm
-    configure_network
-    cleanup_and_finish
+    handle_image || return 1
+    create_vm || return 1
+    configure_limits || return 1
+    setup_vm || return 1
+    configure_network || return 1
+    cleanup_and_finish || return 1
+    build_succeeded=true
 }
-main "$@"
+if [[ "${ONECLICKVIRT_TESTING:-}" != "1" ]]; then
+    main "$@"
+fi

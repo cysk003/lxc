@@ -1,6 +1,6 @@
 #!/bin/bash
 # by https://github.com/oneclickvirt/lxd
-# 2026.04.06
+# 2026.08.30
 
 # 一键安装（交互式）：
 # curl -L https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/lxdinstall.sh -o lxdinstall.sh && chmod +x lxdinstall.sh && bash lxdinstall.sh
@@ -36,6 +36,8 @@ for ((int = 0; int < ${#REGEX[@]}; int++)); do
 done
 TRIED_STORAGE_FILE="/usr/local/bin/lxd_tried_storage"
 INSTALLED_STORAGE_FILE="/usr/local/bin/lxd_installed_storage"
+STORAGE_POOL_FILE="/usr/local/bin/lxd_storage_pool"
+MANAGED_STORAGE_POOL="oneclickvirt"
 LEGACY_TRIED_STORAGE_FILE="/usr/local/bin/incus_tried_storage"
 LEGACY_INSTALLED_STORAGE_FILE="/usr/local/bin/incus_installed_storage"
 if [ ! -d "/usr/local/bin" ]; then
@@ -43,6 +45,39 @@ if [ ! -d "/usr/local/bin" ]; then
 fi
 [ ! -f "$TRIED_STORAGE_FILE" ] && [ -f "$LEGACY_TRIED_STORAGE_FILE" ] && cp "$LEGACY_TRIED_STORAGE_FILE" "$TRIED_STORAGE_FILE"
 [ ! -f "$INSTALLED_STORAGE_FILE" ] && [ -f "$LEGACY_INSTALLED_STORAGE_FILE" ] && cp "$LEGACY_INSTALLED_STORAGE_FILE" "$INSTALLED_STORAGE_FILE"
+
+# An existing pool may contain instances and volumes from an earlier
+# installation. It is never safe for this installer to replace it.
+storage_pool_exists() {
+    local pool_name="${1:-default}"
+    /snap/bin/lxc storage show "$pool_name" >/dev/null 2>&1
+}
+
+valid_storage_pool_name() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
+}
+
+active_storage_pool() {
+    local pool_name=""
+    if [ -r "$STORAGE_POOL_FILE" ]; then
+        IFS= read -r pool_name <"$STORAGE_POOL_FILE" || true
+        if valid_storage_pool_name "$pool_name" && storage_pool_exists "$pool_name"; then
+            printf '%s\n' "$pool_name"
+            return 0
+        fi
+    fi
+    if storage_pool_exists default; then
+        printf '%s\n' default
+        return 0
+    fi
+    return 1
+}
+
+record_storage_pool() {
+    local pool_name="$1"
+    valid_storage_pool_name "$pool_name" || return 1
+    printf '%s\n' "$pool_name" >"$STORAGE_POOL_FILE"
+}
 
 _red() { printf '\033[31m\033[01m%s\033[0m\n' "$*"; }
 _green() { printf '\033[32m\033[01m%s\033[0m\n' "$*"; }
@@ -643,20 +678,26 @@ create_storage_pool_with_custom_path() {
     local backend="$1"
     local storage_path="$2"
     local disk_nums="$3"
+    local pool_name="${4:-$MANAGED_STORAGE_POOL}"
     local loop_file mount_point temp status
+    if ! valid_storage_pool_name "$pool_name"; then
+        _red "Invalid managed storage pool name: $pool_name"
+        return 1
+    fi
+    if storage_pool_exists "$pool_name"; then
+        _yellow "检测到已有 $pool_name 存储池，将保留并复用它"
+        _yellow "An existing $pool_name storage pool was found; preserving and reusing it"
+        return 0
+    fi
     mkdir -p "$storage_path"
     if [ "$backend" = "lvm" ]; then
         loop_file="$storage_path/lvm_pool.img"
         _green "创建 LVM 存储池..."
         _green "Creating LVM storage pool..."
         if [ -f "$loop_file" ]; then
-            _yellow "检测到旧的循环文件，正在清理..."
-            _yellow "Detected old loop file, cleaning up..."
-            vgremove -f lxd_vg 2>/dev/null || true
-            while IFS= read -r old_loop_dev; do
-                [ -n "$old_loop_dev" ] && losetup -d "$old_loop_dev" 2>/dev/null || true
-            done < <(losetup -j "$loop_file" | cut -d: -f1)
-            rm -f "$loop_file"
+            _red "检测到已有 LVM 循环文件，拒绝覆盖：$loop_file"
+            _red "Existing LVM loop file found; refusing to overwrite: $loop_file"
+            return 1
         fi
         _green "创建稀疏文件：$loop_file (${disk_nums}GB)..."
         if ! create_sparse_file "$loop_file" "$disk_nums"; then
@@ -669,7 +710,7 @@ create_storage_pool_with_custom_path() {
         pvcreate "$loop_dev" >/dev/null 2>&1
         vgcreate lxd_vg "$loop_dev" >/dev/null 2>&1
         echo "$loop_file" > "$storage_path/lvm_loop_file.txt"
-        temp=$(/snap/bin/lxc storage create default lvm source=lxd_vg 2>&1)
+        temp=$(/snap/bin/lxc storage create "$pool_name" lvm source=lxd_vg 2>&1)
         status=$?
     elif [ "$backend" = "btrfs" ]; then
         loop_file="$storage_path/btrfs_pool.img"
@@ -677,17 +718,14 @@ create_storage_pool_with_custom_path() {
         _green "创建 btrfs 存储池..."
         _green "Creating btrfs storage pool..."
         if mountpoint -q "$mount_point" 2>/dev/null; then
-            _yellow "检测到旧的挂载点，正在卸载..."
-            _yellow "Detected old mount point, unmounting..."
-            umount "$mount_point" 2>/dev/null || true
+            _red "检测到已挂载的 btrfs 路径，拒绝卸载：$mount_point"
+            _red "Existing btrfs mount found; refusing to unmount: $mount_point"
+            return 1
         fi
         if [ -f "$loop_file" ]; then
-            _yellow "检测到旧的循环文件，正在删除..."
-            _yellow "Detected old loop file, removing..."
-            while IFS= read -r old_loop_dev; do
-                [ -n "$old_loop_dev" ] && losetup -d "$old_loop_dev" 2>/dev/null || true
-            done < <(losetup -j "$loop_file" | cut -d: -f1)
-            rm -f "$loop_file"
+            _red "检测到已有 btrfs 循环文件，拒绝覆盖：$loop_file"
+            _red "Existing btrfs loop file found; refusing to overwrite: $loop_file"
+            return 1
         fi
         mkdir -p "$mount_point"
         _green "创建稀疏文件：$loop_file (${disk_nums}GB)..."
@@ -714,7 +752,7 @@ create_storage_pool_with_custom_path() {
             _green "Added to /etc/fstab for automatic mounting on boot"
         fi
         chmod 711 "$mount_point"
-        temp=$(/snap/bin/lxc storage create default btrfs source="$mount_point" 2>&1)
+        temp=$(/snap/bin/lxc storage create "$pool_name" btrfs source="$mount_point" 2>&1)
         status=$?
     elif [ "$backend" = "zfs" ]; then
         loop_file="$storage_path/zfs_pool.img"
@@ -722,14 +760,14 @@ create_storage_pool_with_custom_path() {
         _green "创建 ZFS 存储池..."
         _green "Creating ZFS storage pool..."
         if zpool list "$zpool_name" >/dev/null 2>&1; then
-            _yellow "检测到旧的 ZFS pool，正在删除..."
-            _yellow "Detected old ZFS pool, removing..."
-            zpool destroy -f "$zpool_name" 2>/dev/null || true
+            _red "检测到已有 ZFS 存储池，拒绝销毁：$zpool_name"
+            _red "Existing ZFS pool found; refusing to destroy: $zpool_name"
+            return 1
         fi
         if [ -f "$loop_file" ]; then
-            _yellow "检测到旧的循环文件，正在删除..."
-            _yellow "Detected old loop file, removing..."
-            rm -f "$loop_file"
+            _red "检测到已有 ZFS 循环文件，拒绝覆盖：$loop_file"
+            _red "Existing ZFS loop file found; refusing to overwrite: $loop_file"
+            return 1
         fi
         _green "创建稀疏文件：$loop_file (${disk_nums}GB)..."
         if ! create_sparse_file "$loop_file" "$disk_nums"; then
@@ -742,7 +780,10 @@ create_storage_pool_with_custom_path() {
             _red "ZFS pool creation failed!"
             return 1
         fi
-        temp=$(/snap/bin/lxc storage create default zfs source="$zpool_name" 2>&1)
+        temp=$(/snap/bin/lxc storage create "$pool_name" zfs source="$zpool_name" 2>&1)
+        status=$?
+    elif [ "$backend" = "dir" ]; then
+        temp=$(/snap/bin/lxc storage create "$pool_name" dir source="$storage_path" 2>&1)
         status=$?
     else
         _red "不支持的存储后端：$backend"
@@ -757,43 +798,38 @@ execute_storage_init() {
     local backend="$1"
     local temp
     local status
+    local existing_pool
+
+    if existing_pool=$(active_storage_pool); then
+        _yellow "检测到现有 $existing_pool 存储池，将保留并复用它"
+        _yellow "An existing $existing_pool storage pool was found; preserving and reusing it"
+        record_storage_pool "$existing_pool"
+        echo "Existing $existing_pool storage pool preserved"
+        return 0
+    fi
     if [ -n "$storage_path" ]; then
-        /snap/bin/lxd init --auto 2>/dev/null || true
+        # Initialize the daemon without deleting the default pool that the
+        # automatic initializer may create. The requested custom path is used
+        # by a separate managed pool and build scripts select that pool later.
+        if ! /snap/bin/lxd init --auto 2>/dev/null; then
+            _red "LXD 初始化失败，无法创建自定义存储池"
+            _red "LXD initialization failed; cannot create the custom storage pool"
+            return 1
+        fi
         _yellow "当前存储池列表："
         _yellow "Current storage pools:"
         /snap/bin/lxc storage list 2>/dev/null || true
-        if /snap/bin/lxc storage list 2>/dev/null | grep -q "^| default"; then
-            _yellow "检测到 default 存储池存在，尝试删除..."
-            _yellow "Default storage pool exists, trying to delete..."
-            /snap/bin/lxc storage volume list default 2>/dev/null | awk 'NR>3 {print $2}' | while read -r vol; do
-                [ -n "$vol" ] && /snap/bin/lxc storage volume delete default "$vol" 2>/dev/null || true
-            done
-            if /snap/bin/lxc storage delete default 2>/dev/null; then
-                _green "成功删除 default 存储池"
-                _green "Successfully deleted default storage pool"
-            else
-                _red "删除 default 存储池失败，存储池可能正在使用中"
-                _red "Failed to delete default storage pool, it may be in use"
-                _yellow "检查正在使用该存储池的配置..."
-                _yellow "Checking profiles using this storage pool..."
-                /snap/bin/lxc profile list 2>/dev/null
-                /snap/bin/lxc profile show default 2>/dev/null | grep -A5 "devices:" || true
-                _yellow "尝试从 default profile 中移除 root 设备..."
-                _yellow "Trying to remove root device from default profile..."
-                /snap/bin/lxc profile device remove default root 2>/dev/null || true
-                if /snap/bin/lxc storage delete default 2>/dev/null; then
-                    _green "成功删除 default 存储池"
-                    _green "Successfully deleted default storage pool"
-                else
-                    _red "仍然无法删除存储池，退出"
-                    _red "Still cannot delete storage pool, exiting"
-                    return 1
-                fi
-            fi
+        if storage_pool_exists "$MANAGED_STORAGE_POOL"; then
+            _yellow "检测到已有 $MANAGED_STORAGE_POOL 存储池，将保留并复用它"
+            _yellow "An existing $MANAGED_STORAGE_POOL storage pool was found; preserving and reusing it"
+            record_storage_pool "$MANAGED_STORAGE_POOL"
+            echo "Existing $MANAGED_STORAGE_POOL storage pool preserved"
+            return 0
         fi
-        if create_storage_pool_with_custom_path "$backend" "$storage_path" "$disk_nums"; then
+        if create_storage_pool_with_custom_path "$backend" "$storage_path" "$disk_nums" "$MANAGED_STORAGE_POOL"; then
             temp="Storage pool created successfully"
             status=0
+            record_storage_pool "$MANAGED_STORAGE_POOL"
             if ! /snap/bin/lxc network list 2>/dev/null | grep -q lxdbr0; then
                 _yellow "网络未初始化，正在初始化网络配置..."
                 _yellow "Network not initialized, initializing network configuration..."
@@ -804,8 +840,15 @@ execute_storage_init() {
             status=1
         fi
     else
-        temp=$(/snap/bin/lxd init --storage-backend "$backend" --storage-create-loop "$disk_nums" --storage-pool default --auto 2>&1)
+        if [ "$backend" = "dir" ]; then
+            temp=$(/snap/bin/lxd init --storage-backend dir --storage-pool default --auto 2>&1)
+        else
+            temp=$(/snap/bin/lxd init --storage-backend "$backend" --storage-create-loop "$disk_nums" --storage-pool default --auto 2>&1)
+        fi
         status=$?
+        if [ "$status" -eq 0 ] && storage_pool_exists default; then
+            record_storage_pool default
+        fi
     fi
     echo "$temp"
     return $status
@@ -814,7 +857,7 @@ execute_storage_init() {
 init_storage_backend() {
     local backend="$1"
     if is_storage_tried "$backend"; then
-        _yellow "已经尝试过 $backend，跳过"
+        _yellow "已经尝试过 ${backend}，跳过"
         _yellow "Already tried $backend, skipping"
         return 1
     fi
@@ -822,16 +865,12 @@ init_storage_backend() {
         _green "使用默认dir类型无限定存储池大小"
         _green "Using default dir type with unlimited storage pool size"
         echo "dir" >/usr/local/bin/lxd_storage_type
-        if [ -n "$storage_path" ]; then
-            mkdir -p "$storage_path"
-            /snap/bin/lxd init --auto
-            /snap/bin/lxc storage delete default 2>/dev/null || true
-            /snap/bin/lxc storage create default dir source="$storage_path"
-        else
-            /snap/bin/lxd init --storage-backend "$backend" --auto
-        fi
+        local temp status
+        temp=$(execute_storage_init "$backend")
+        status=$?
+        echo "$temp"
         record_tried_storage "$backend"
-        return $?
+        return "$status"
     fi
     _green "尝试使用 $backend 类型，存储池大小为 $disk_nums"
     _green "Trying to use $backend type with storage pool size $disk_nums"
@@ -907,6 +946,13 @@ init_storage_backend() {
 }
 
 setup_storage() {
+    local existing_pool
+    if existing_pool=$(active_storage_pool); then
+        _green "检测到现有 $existing_pool 存储池，跳过后端重新初始化"
+        _green "An existing $existing_pool storage pool was found; skipping backend reinitialization"
+        record_storage_pool "$existing_pool"
+        return 0
+    fi
     if [ -f "/usr/local/bin/lxd_reboot" ]; then
         REBOOT_BACKEND=$(cat /usr/local/bin/lxd_reboot)
         _green "检测到系统重启，尝试继续使用 $REBOOT_BACKEND"
@@ -932,14 +978,7 @@ setup_storage() {
     _yellow "所有存储类型尝试失败，使用 dir 作为备选"
     _yellow "All storage types failed, using dir as fallback"
     echo "dir" >/usr/local/bin/lxd_storage_type
-    if [ -n "$storage_path" ]; then
-        mkdir -p "$storage_path"
-        /snap/bin/lxd init --auto
-        /snap/bin/lxc storage delete default 2>/dev/null || true
-        /snap/bin/lxc storage create default dir source="$storage_path"
-    else
-        /snap/bin/lxd init --storage-backend dir --auto
-    fi
+    execute_storage_init dir
 }
 
 configure_lxd_network() {
@@ -1123,4 +1162,6 @@ main() {
     show_completion_info
 }
 
-main
+if [[ "${ONECLICKVIRT_TESTING:-}" != "1" ]]; then
+    main
+fi

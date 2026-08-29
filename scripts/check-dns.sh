@@ -1,6 +1,6 @@
 #!/bin/bash
 #from https://github.com/oneclickvirt/lxd
-# 2026.02.28
+# 2026.08.30
 
 # 服务管理兼容性函数
 service_manager() {
@@ -419,7 +419,7 @@ if check_nmcli; then
     echo "活动连接: $CONN_NAME"
     
     if check_nmcli_dns_configured "$CONN_NAME"; then
-        echo "DNS 配置已存在于连接 $CONN_NAME，无需修改"
+        echo "DNS 配置已存在于连接 ${CONN_NAME}，无需修改"
     else
         echo "设置 IPv4 DNS: ${DNS_SERVERS_IPV4[*]}"
         echo "设置 IPv6 DNS: ${DNS_SERVERS_IPV6[*]}"
@@ -444,7 +444,7 @@ elif check_resolvectl && service_manager is-active systemd-resolved; then
     echo "默认接口: $IFACE"
     
     if check_resolvectl_dns_configured "$IFACE"; then
-        echo "DNS 配置已存在于接口 $IFACE，无需修改"
+        echo "DNS 配置已存在于接口 ${IFACE}，无需修改"
     else
         echo "设置 DNS 服务器..."
         resolvectl dns "$IFACE" "${DNS_SERVERS_IPV4[@]}" "${DNS_SERVERS_IPV6[@]}"

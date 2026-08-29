@@ -52,3 +52,6 @@ jobs:
           set -euo pipefail
           bash tests/build_ipv6_network_test.sh
           bash tests/test_ipv6_network.sh
+          bash tests/build_failure_control_flow_test.sh
+          bash tests/storage_pool_preservation_test.sh
+          bash tests/batch_transaction_test.sh
