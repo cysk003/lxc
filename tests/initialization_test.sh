@@ -181,3 +181,7 @@ fi
 grep -Fq 'sysctl -w net.ipv4.ip_forward=1 >/dev/null || return 1' <<<"$install_lxd_source" ||
     fail 'LXD must stop when required IPv4 forwarding cannot be enabled'
 printf 'LXD initialization fault-injection tests passed (12 scenarios)\n'
+grep -Fq '"ca-certificates"' "$repo_root/scripts/ssh_bash.sh" ||
+    fail 'LXD bash guest bootstrap must install TLS root certificates'
+grep -Fq 'ca-certificates' "$repo_root/scripts/ssh_sh.sh" ||
+    fail 'LXD Alpine guest bootstrap must install TLS root certificates'

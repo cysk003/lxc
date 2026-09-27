@@ -111,7 +111,7 @@ checkupdate() {
 }
 
 install_required_modules() {
-    modules=("dos2unix" "wget" "curl" "sudo" "bash" "lsof" "ssh" "sshpass" "openssh-server")
+    modules=("dos2unix" "wget" "curl" "sudo" "bash" "lsof" "ssh" "sshpass" "openssh-server" "ca-certificates")
     for module in "${modules[@]}"; do
         # 特殊处理Alpine系统的包名差异
         if [ "$SYSTEM" = "Alpine" ]; then

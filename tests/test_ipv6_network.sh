@@ -13,13 +13,21 @@ fail() {
 mkdir -p "$tmpdir/bin" "$tmpdir/state"
 cat >"$tmpdir/bin/ip" <<'STUB'
 #!/usr/bin/env bash
-if [[ "${LXD_TEST_NO_LOCAL_IPV6:-}" == "1" ]]; then
-    exit 0
-fi
-if [[ "${LXD_TEST_LOCAL_ULA_FIRST:-}" == "1" ]]; then
-    printf '2: eth0    inet6 fd42::1/64 scope global\n'
-fi
-printf '2: eth0    inet6 2606:4700::1111/64 scope global\n'
+case "$*" in
+    '-j -6 addr show')
+        if [[ "${LXD_TEST_DELEGATED:-}" == 1 ]]; then
+            printf '\033[36m%s\033[0m\n' '[{"ifname":"vmbr0","addr_info":[{"family":"inet6","local":"2a14:7c0:1002:10f8::1","prefixlen":128,"scope":"global"}]},{"ifname":"vmbr2","addr_info":[{"family":"inet6","local":"2a14:7c0:1002:10f8::1","prefixlen":38,"scope":"global"}]}]'
+        elif [[ "${LXD_TEST_NO_LOCAL_IPV6:-}" == 1 ]]; then
+            printf '%s\n' '[{"ifname":"eth0","addr_info":[]}]'
+        elif [[ "${LXD_TEST_LOCAL_ULA_FIRST:-}" == 1 ]]; then
+            printf '%s\n' '[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"fd42::1","prefixlen":64,"scope":"global"},{"family":"inet6","local":"2606:4700::1111","prefixlen":64,"scope":"global"}]}]'
+        else
+            printf '%s\n' '[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"2606:4700::1111","prefixlen":64,"scope":"global"}]}]'
+        fi
+        ;;
+    '-j -6 route show default') printf '%s\n' '[]' ;;
+    *) exit 2 ;;
+esac
 STUB
 cat >"$tmpdir/bin/curl" <<'STUB'
 #!/usr/bin/env bash
@@ -75,9 +83,11 @@ ip() {
             ;;
     esac
 }
+export LXD_TEST_DELEGATED=1
 check_ipv6 >/dev/null || fail "delegated /38 was not accepted"
 [[ "$IPV6" == "2a14:7c0:1002:10f8::1" ]] || fail "delegated /38 selection = '$IPV6'"
 [[ "$(ipv6_uplink_interface "$IPV6")" == "vmbr2" ]] || fail "delegated /38 interface was not selected"
+unset LXD_TEST_DELEGATED
 unset -f ip
 unset LXD_TEST_NO_LOCAL_IPV6
 

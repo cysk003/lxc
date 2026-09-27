@@ -31,6 +31,7 @@ done
 if [ "$os_id" = "alpine" ]; then
   apk update
   apk add --no-cache openssh-server
+  apk add --no-cache ca-certificates
   apk add --no-cache sshpass
   apk add --no-cache openssh-keygen
   apk add --no-cache bash

@@ -29,6 +29,60 @@ _yellow() { printf '\033[33m\033[01m%s\033[0m\n' "$*"; }
 _blue() { printf '\033[36m\033[01m%s\033[0m\n' "$*"; }
 reading() { read -rp "$(_green "$1")" "$2"; }
 
+lxd_other_runtime_uses_ipv6_cron() {
+    command -v incus >/dev/null 2>&1
+}
+
+remove_lxd_ipv6_cron() {
+    local cron_file="${OCV_IPV6_CRON_FILE:-/etc/cron.d/oneclickvirt-ipv6}"
+    local lock_file="${OCV_IPV6_CRON_LOCK:-/run/lock/oneclickvirt-ipv6.lock}"
+    local lock_dir tmp status=0
+    local expected="*/1 * * * * root curl --noproxy '*' -6 -fsS --connect-timeout 6 --max-time 6 https://ipv6.ip.sb && curl --noproxy '*' -6 -fsS --connect-timeout 6 --max-time 6 https://ipv6.ip.sb"
+
+    [ -e "$cron_file" ] || [ -L "$cron_file" ] || return 0
+    if lxd_other_runtime_uses_ipv6_cron; then
+        _yellow "  检测到 Incus，保留共享 IPv6 定时任务 / Incus detected; preserving shared IPv6 cron."
+        return 0
+    fi
+    if [ -L "$cron_file" ] || [ ! -f "$cron_file" ]; then
+        _yellow "  IPv6 cron 不是普通文件，保留人工管理内容 / Preserving non-regular IPv6 cron path."
+        return 0
+    fi
+
+    (
+    lock_dir=${lock_file%/*}
+    [ "$lock_dir" != "$lock_file" ] || lock_dir=.
+    [ ! -L "$lock_dir" ] || return 1
+    mkdir -p -- "$lock_dir" || return 1
+    [ ! -L "$lock_file" ] || return 1
+    exec {lxd_ipv6_cron_lock_fd}>>"$lock_file" || return 1
+    flock -xw 10 "$lxd_ipv6_cron_lock_fd" || return 1
+    if [ -L "$cron_file" ] || [ ! -f "$cron_file" ]; then
+        flock -u "$lxd_ipv6_cron_lock_fd"
+        exec {lxd_ipv6_cron_lock_fd}>&-
+        return 0
+    fi
+    tmp=$(mktemp "${cron_file}.tmp.XXXXXX") || return 1
+    cp -p -- "$cron_file" "$tmp" || { rm -f -- "$tmp"; return 1; }
+    awk -v expected="$expected" '$0 == expected { removed=1; next } { print } END { exit removed ? 0 : 3 }' \
+        "$cron_file" >"$tmp" || status=$?
+    if [ "$status" -eq 0 ]; then
+        if [ -s "$tmp" ]; then
+            mv -f -- "$tmp" "$cron_file" || return 1
+        else
+            rm -f -- "$cron_file" "$tmp" || return 1
+        fi
+    elif [ "$status" -eq 3 ]; then
+        rm -f -- "$tmp" || return 1
+    else
+        rm -f -- "$tmp"
+        return "$status"
+    fi
+    flock -u "$lxd_ipv6_cron_lock_fd"
+    exec {lxd_ipv6_cron_lock_fd}>&-
+    )
+}
+
 is_true() {
     local value
     value=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
@@ -578,6 +632,7 @@ files_to_remove=(
 for f in "${files_to_remove[@]}"; do
     [ -f "$f" ] && rm -f "$f" && _yellow "  已删除 / Removed: $f"
 done
+remove_lxd_ipv6_cron || exit 1
 _green "  文件清理完成 / File cleanup done."
 
 # ─── 6. 清理 iptables 规则 ───────────────────────────────────────────────────

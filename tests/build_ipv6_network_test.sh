@@ -7,8 +7,48 @@ export LXD_STATE_DIR
 LXD_STATE_DIR=$(mktemp -d)
 trap 'rm -rf "$LXD_STATE_DIR"' EXIT
 
+# The allocator consumes iproute2 JSON. Use a deterministic fixture so this
+# contract test also runs on macOS and minimal CI runners without `ip`.
+TEST_BIN_DIR=$(mktemp -d)
+trap 'rm -rf "$LXD_STATE_DIR" "$TEST_BIN_DIR"' EXIT
+cat >"$TEST_BIN_DIR/ip" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+    '-j -6 addr show')
+        if [[ "${LXD_TEST_TUNNEL:-}" == 1 ]]; then
+            printf '\033[36m%s\033[0m\n' '[{"ifname":"he-ipv6","addr_info":[{"family":"inet6","local":"2606:4700::1","prefixlen":64,"scope":"global"}]}]'
+        elif [[ "${LXD_TEST_SAME_INTERFACE:-}" == 1 ]]; then
+            printf '\033[36m%s\033[0m\n' '[{"ifname":"eth0","addr_info":[{"family":"inet6","local":"2a14:7c0:1002:10f8::1","prefixlen":128,"scope":"global"},{"family":"inet6","local":"2a14:7c0:1002:10f8::2","prefixlen":38,"scope":"global"}]}]'
+        else
+            printf '%s\n' '[{"ifname":"eth0","addr_info":[]}]'
+        fi
+        ;;
+    '-j -6 route show default')
+        if [[ -n "${LXD_TEST_ROUTE_STATE:-}" && -f "$LXD_TEST_ROUTE_STATE" ]]; then
+            printf '%s\n' '[{"dst":"default","dev":"eth0","gateway":"2606:4700::1"}]'
+        else
+            printf '%s\n' '[]'
+        fi
+        ;;
+    '-j -6 neigh show dev eth0')
+        printf '%s\n' '[{"dst":"2606:4700::1","router":true}]'
+        ;;
+    '-j -6 route show table all')
+        printf '%s\n' '[]'
+        ;;
+    *)
+        printf '%s\n' 'default via 2606:4700::1 dev eth0'
+        ;;
+esac
+STUB
+chmod +x "$TEST_BIN_DIR/ip"
+export PATH="$TEST_BIN_DIR:$PATH"
+
 # shellcheck disable=SC1091 # The test sources the repository script through a computed path.
 source "$ROOT_DIR/scripts/build_ipv6_network.sh"
+
+gateway_rows=$(printf '\033[35mRouteur : fe80::1\033[0m\n路由器：fe80::2\nRouter: fe80::3\n' | rdisc6_router_addresses)
+[[ "$gateway_rows" == $'fe80::1\nfe80::2\nfe80::3' ]] || fail "localized router-advertisement gateways: $gateway_rows"
 
 fail() {
     printf 'FAIL: %s\n' "$1" >&2
@@ -105,12 +145,20 @@ ip() {
     esac
 }
 export LXD_IPV6_UPLINK=he-ipv6
+export LXD_TEST_TUNNEL=1
 assert_eq "he-ipv6" "$(ipv6_uplink_interface)" "explicit tunnel uplink"
 assert_eq "2606:4700::1/64" "$(ipv6_uplink_cidr he-ipv6 2606:4700::1)" "tunnel address selection"
+unset LXD_TEST_TUNNEL
 unset LXD_IPV6_UPLINK
 unset -f ip
 
+export LXD_TEST_SAME_INTERFACE=1
+assert_eq eth0 "$(ipv6_uplink_interface '2a14:7c0:1002:10f8::1')" 'same-interface wider prefix uplink'
+assert_eq '2a14:7c0:1002:10f8::2/38' "$(ipv6_uplink_cidr eth0 '2a14:7c0:1002:10f8::1')" 'same-interface wider prefix CIDR'
+unset LXD_TEST_SAME_INTERFACE
+
 route_state="$LXD_STATE_DIR/route-state"
+export LXD_TEST_ROUTE_STATE="$route_state"
 ip() {
     case "$*" in
     "-6 route show default") ;;
@@ -125,6 +173,7 @@ ip() {
 }
 curl() { return 0; }
 export LXD_IPV6_UPLINK=eth0
+export LXD_TEST_SAME_INTERFACE=1
 ensure_ipv6_default_route || fail "IPv6 default route was not recovered from a verified router neighbor"
 [ -f "$route_state" ] || fail "verified IPv6 route was not retained"
 rm -f "$route_state"
@@ -134,7 +183,9 @@ if ensure_ipv6_default_route; then
 fi
 [ ! -e "$route_state" ] || fail "unverified IPv6 route was not rolled back"
 unset LXD_IPV6_UPLINK
+unset LXD_TEST_SAME_INTERFACE
 unset -f ip curl
+unset LXD_TEST_ROUTE_STATE
 
 legacy_cleanup="$LXD_STATE_DIR/remove_route.sh"
 printf '%s\n' '#!/bin/bash' 'ip addr del fe80::1/64 dev eth0' >"$legacy_cleanup"
@@ -172,7 +223,11 @@ ip() {
 }
 assert_eq vmbr2 "$(get_interface)" "saved routed bridge wins over default route"
 rm -f "$LXD_STATE_DIR/lxd_ipv6_mapping_interface"
+export LXD_TEST_ROUTE_STATE="$LXD_STATE_DIR/restoration-route"
+touch "$LXD_TEST_ROUTE_STATE"
 assert_eq eth0 "$(get_interface)" "IPv6 default-route fallback"
+rm -f "$LXD_TEST_ROUTE_STATE"
+unset LXD_TEST_ROUTE_STATE
 unset -f ip
 
 printf '%s\n' 128 >"$LXD_STATE_DIR/lxd_ipv6_mapping_prefix_len"
@@ -182,6 +237,8 @@ if read_strict_prefix_len "$LXD_STATE_DIR/lxd_ipv6_mapping_prefix_len" >/dev/nul
     fail "multiline mapping prefix was accepted"
 fi
 restore_calls="$LXD_STATE_DIR/restore-calls"
+# The JSON parser itself is covered by add_ipv6_restore_test.sh.
+restore_ipv6_json_rows() { [ "$1" = addresses ]; }
 # shellcheck disable=SC2329 # Called indirectly by restore_address.
 ip() {
     case "$*" in
@@ -194,6 +251,7 @@ restore_address 'fd42::1' eth0 64
 [ ! -s "$restore_calls" ] || fail "ULA was restored as a public address"
 restore_address '2606:4700::1' eth0 128
 grep -Fq -- '-6 addr replace 2606:4700::1/128 dev eth0' "$restore_calls" || fail "global /128 mapping was not restored"
+unset -f restore_ipv6_json_rows
 unset -f ip
 
 grep -Fq 'wait_for_container_status "$CONTAINER_NAME" "STOPPED" 24 || return 1' "$ROOT_DIR/scripts/build_ipv6_network.sh" ||

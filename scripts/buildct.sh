@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Resolve this before any helper changes directory to /root.  BASH_SOURCE can
+# be relative when the script is invoked as `bash scripts/buildct.sh`.
+OCV_BUILDCT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)" || OCV_BUILDCT_DIR=""
 # from
 # https://github.com/oneclickvirt/lxd
 # 2026.08.30
@@ -258,6 +261,92 @@ remove_device_if_exists() {
 
 ensure_container_ipv6_cron() {
     lxc exec "$name" -- sh -c 'set -eu; if [ -L /etc/cron.d ]; then exit 1; fi; [ -d /etc/cron.d ] || exit 0; mkdir -p /run/lock; test ! -L /run/lock; lock=/run/lock/oneclickvirt-ipv6.lock.d; acquired=0; i=0; while [ "$i" -lt 100 ]; do if mkdir "$lock" 2>/dev/null; then acquired=1; break; fi; i=$((i + 1)); sleep 0.1; done; [ "$acquired" -eq 1 ]; trap '\''rmdir "$lock" 2>/dev/null || true'\'' EXIT; target=/etc/cron.d/oneclickvirt-ipv6; line="*/1 * * * * root curl --noproxy '\''*'\'' -6 -fsS --connect-timeout 6 --max-time 6 https://ipv6.ip.sb >/dev/null 2>&1 && curl --noproxy '\''*'\'' -6 -fsS --connect-timeout 6 --max-time 6 https://ipv6.ip.sb >/dev/null 2>&1"; if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then exit 1; fi; if [ -f "$target" ] && grep -Fqx "$line" "$target"; then exit 0; fi; tmp=$(mktemp /etc/cron.d/.oneclickvirt-ipv6.XXXXXX); trap '\''rm -f -- "$tmp"; rmdir "$lock" 2>/dev/null || true'\'' EXIT; if [ -f "$target" ]; then cat "$target" >"$tmp"; last=$(tail -c 1 "$target" 2>/dev/null | od -An -t x1 | tr -d "[:space:]"); [ -z "$last" ] || [ "$last" = 0a ] || printf "\n" >>"$tmp"; fi; printf "%s\n" "$line" >>"$tmp"; chmod 0644 "$tmp"; mv -f "$tmp" "$target"'
+}
+
+configure_ipv6_only_dns() {
+    # IPv6-only instances have no managed IPv4 bridge to provide the usual
+    # 127.0.0.53 stub. Install a small atomic resolver file using IPv6 DNS.
+    lxc exec "$name" -- sh -c 'set -eu; if [ -L /etc/resolv.conf ]; then rm -f /etc/resolv.conf; fi; if [ -e /etc/resolv.conf ] && [ ! -f /etc/resolv.conf ]; then exit 1; fi; tmp=$(mktemp /etc/.resolv.conf.ocv.XXXXXX); printf "%s\n" "nameserver 2606:4700:4700::1111" "nameserver 2001:4860:4860::8888" >"$tmp"; chmod 0644 "$tmp"; mv -f "$tmp" /etc/resolv.conf'
+}
+
+normalize_network_type() {
+    network_type=$(printf '%s' "${OCV_NETWORK_TYPE:-}" | tr '[:upper:]' '[:lower:]')
+    enable_ipv6=$(printf '%s' "${enable_ipv6:-n}" | tr '[:upper:]' '[:lower:]')
+    if [ -z "$network_type" ]; then
+        if [ "${enable_ipv6:-n}" = "y" ]; then
+            network_type="nat_ipv4_ipv6"
+        else
+            network_type="nat_ipv4"
+        fi
+    fi
+    case "$network_type" in
+    nat_ipv4)
+        enable_ipv6="n"
+        ;;
+    nat_ipv4_ipv6)
+        enable_ipv6="y"
+        ;;
+    ipv6_only)
+        enable_ipv6="y"
+        ;;
+    *)
+        echo "Error: OCV_NETWORK_TYPE must be nat_ipv4, nat_ipv4_ipv6, or ipv6_only." >&2
+        echo "错误：OCV_NETWORK_TYPE 必须为 nat_ipv4、nat_ipv4_ipv6 或 ipv6_only。" >&2
+        return 1
+        ;;
+    esac
+}
+
+require_public_ipv6_result() {
+    case "${OCV_REQUIRE_PUBLIC_IPV6:-no}" in
+    1 | true | TRUE | yes | YES) ;;
+    *) return 0 ;;
+    esac
+    local record="${name}_v6" address
+    if [ ! -s "$record" ]; then
+        echo "Error: independent public IPv6 was required, but IPv6 setup only produced a fallback or no address." >&2
+        echo "错误：当前模式要求独立公网 IPv6，但 IPv6 配置仅生成了回退网络或未分配地址。" >&2
+        return 1
+    fi
+    address=$(tail -n 1 "$record")
+    python3 - "$address" <<'PY'
+import ipaddress
+import sys
+try:
+    address = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if address.version == 6 and address.is_global else 1)
+PY
+}
+
+# A previous installer run may have left an older helper in /root.  Never
+# silently reuse it: prefer the versioned helper next to this script, or
+# download and validate the current marker before replacing the cached copy.
+refresh_ipv6_helper() {
+    local target="${1:-./build_ipv6_network.sh}" source_path script_path temporary
+    local marker='# oneclickvirt-ipv6-helper-version: 2026.09.20'
+    script_path="${OCV_BUILDCT_DIR:-}"
+    source_path="$script_path/build_ipv6_network.sh"
+    if [ -f "$source_path" ] && grep -Fqx "$marker" "$source_path"; then
+        if ! cmp -s "$source_path" "$target"; then
+            cp -f -- "$source_path" "$target" || return 1
+        fi
+        chmod +x "$target" || return 1
+        return 0
+    fi
+    if [ -f "$target" ] && grep -Fqx "$marker" "$target"; then
+        chmod +x "$target" || return 1
+        return 0
+    fi
+    temporary=$(mktemp "${target}.tmp.XXXXXX") || return 1
+    if ! download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/build_ipv6_network.sh" "$temporary" ||
+       ! grep -Fqx "$marker" "$temporary"; then
+        rm -f -- "$temporary"
+        echo "Error: downloaded IPv6 helper is missing the expected version marker." >&2
+        return 1
+    fi
+    chmod +x "$temporary" && mv -f -- "$temporary" "$target"
 }
 
 download_host_file() {
@@ -672,8 +761,12 @@ configure_port() {
             return 1
         fi
     fi
-    replace_proxy_device ssh-port "listen=tcp:$ipv4_address:$sshn" "connect=tcp:$container_ip:22" nat=true || return 1
-    if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
+    if [ "$network_type" != "ipv6_only" ]; then
+        replace_proxy_device ssh-port "listen=tcp:$ipv4_address:$sshn" "connect=tcp:$container_ip:22" nat=true || return 1
+    else
+        remove_device_if_exists ssh-port
+    fi
+    if [ "$network_type" != "ipv6_only" ] && [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
         replace_proxy_device nattcp-ports "listen=tcp:$ipv4_address:$nat1-$nat2" "connect=tcp:0.0.0.0:$nat1-$nat2" nat=true || return 1
         replace_proxy_device natudp-ports "listen=udp:$ipv4_address:$nat1-$nat2" "connect=udp:0.0.0.0:$nat1-$nat2" nat=true || return 1
     else
@@ -688,11 +781,9 @@ configure_ipv6() {
         if [ "$enable_ipv6" == "y" ]; then
             ensure_container_ipv6_cron || return 1
             sleep 1
-            if [ ! -f "./build_ipv6_network.sh" ]; then
-                download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/build_ipv6_network.sh" build_ipv6_network.sh || return 1
-                chmod +x build_ipv6_network.sh || return 1
-            fi
+            refresh_ipv6_helper ./build_ipv6_network.sh || return 1
             ./build_ipv6_network.sh "$name" || return 1
+            require_public_ipv6_result || return 1
         fi
     fi
 }
@@ -733,8 +824,10 @@ safe_shutdown_container() {
     local waited=0
     while [ "$waited" -lt "$max_shutdown_wait" ]; do
         local container_status
-        container_status=$(lxc info "$name" | grep "Status:" | awk '{print $2}')
-        if [ "$container_status" = "STOPPED" ]; then
+        container_status=$(lxc list "$name" --format=json 2>/dev/null |
+            jq -er --arg name "$name" '[.[] | select(.name == $name) | .status_code] |
+                if length == 1 then .[0] else error("container status is unavailable") end') || return 1
+        if [ "$container_status" = 102 ]; then
             echo "Container has been safely stopped"
             echo "容器已安全停止"
             return 0
@@ -757,10 +850,24 @@ configure_network_speed() {
     else
         speed_limit=$(($in > $out ? $in : $out))
     fi
-    lxc config device set "$name" eth0 limits.egress "$out"Mbit || return 1
-    lxc config device set "$name" eth0 limits.ingress "$in"Mbit || return 1
-    lxc config device set "$name" eth0 limits.max "$speed_limit"Mbit || return 1
+    if [ "$network_type" = "ipv6_only" ]; then
+        # The default profile's eth0 otherwise keeps private IPv4/DHCP/NAT
+        # alive even though no IPv4 proxy devices were created.  Mask that
+        # inherited NIC locally and apply limits to the routed IPv6 device.
+        lxc config device remove "$name" eth0 >/dev/null 2>&1 || true
+        lxc config device add "$name" eth0 none || return 1
+        lxc config device set "$name" eth1 limits.egress "$out"Mbit || return 1
+        lxc config device set "$name" eth1 limits.ingress "$in"Mbit || return 1
+        lxc config device set "$name" eth1 limits.max "$speed_limit"Mbit || return 1
+    else
+        lxc config device set "$name" eth0 limits.egress "$out"Mbit || return 1
+        lxc config device set "$name" eth0 limits.ingress "$in"Mbit || return 1
+        lxc config device set "$name" eth0 limits.max "$speed_limit"Mbit || return 1
+    fi
     lxc start "$name" || return 1
+    if [ "$network_type" = "ipv6_only" ]; then
+        configure_ipv6_only_dns || return 1
+    fi
 }
 
 cleanup_and_output() {
@@ -804,6 +911,7 @@ main() {
     out="${9:-10240}"
     enable_ipv6="${10:-N}"
     enable_ipv6=$(echo "$enable_ipv6" | tr '[:upper:]' '[:lower:]')
+    normalize_network_type || return 1
     system="${11:-debian12}"
     ensure_lxd_ready || return 1
     if ! normalize_image_system "$system"; then
@@ -823,6 +931,7 @@ main() {
     configure_security || return 1
     setup_system || return 1
     configure_port || return 1
+    configure_ipv6 || return 1
     configure_network_speed || return 1
     cleanup_and_output || return 1
     build_succeeded=true
